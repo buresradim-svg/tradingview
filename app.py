@@ -1,11 +1,8 @@
 import os
-import json
 import time
-import threading
 import requests
 from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string
-from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -547,8 +544,7 @@ def index():
 @app.route("/api/data")
 def api_data():
     if cache["data"] is None and not cache["updating"]:
-        threading.Thread(target=refresh_data, daemon=True).start()
-        return jsonify({"error": "Data se načítají, zkus za 30 sekund.", "updating": True})
+        refresh_data()
     if cache["error"] and cache["data"] is None:
         return jsonify({"error": cache["error"]})
     return jsonify({
@@ -561,14 +557,10 @@ def api_data():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    threading.Thread(target=refresh_data, daemon=True).start()
+    refresh_data()
     return jsonify({"ok": True})
 
 
 if __name__ == "__main__":
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(refresh_data, "interval", hours=1)
-    scheduler.start()
-    threading.Thread(target=refresh_data, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
