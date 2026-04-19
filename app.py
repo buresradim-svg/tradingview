@@ -9,17 +9,19 @@ app = Flask(__name__)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 COINS = [
-    {"id": "bitcoin",       "sym": "BTC",  "tv": "BINANCE:BTCUSDT"},
-    {"id": "ethereum",      "sym": "ETH",  "tv": "BINANCE:ETHUSDT"},
-    {"id": "solana",        "sym": "SOL",  "tv": "BINANCE:SOLUSDT"},
-    {"id": "binancecoin",   "sym": "BNB",  "tv": "BINANCE:BNBUSDT"},
-    {"id": "ripple",        "sym": "XRP",  "tv": "BINANCE:XRPUSDT"},
-    {"id": "cardano",       "sym": "ADA",  "tv": "BINANCE:ADAUSDT"},
-    {"id": "avalanche-2",   "sym": "AVAX", "tv": "BINANCE:AVAXUSDT"},
-    {"id": "chainlink",     "sym": "LINK", "tv": "BINANCE:LINKUSDT"},
-    {"id": "polkadot",      "sym": "DOT",  "tv": "BINANCE:DOTUSDT"},
-    {"id": "uniswap",       "sym": "UNI",  "tv": "BINANCE:UNIUSDT"},
+    {"sym": "BTC",  "pair": "BTCUSDT"},
+    {"sym": "ETH",  "pair": "ETHUSDT"},
+    {"sym": "SOL",  "pair": "SOLUSDT"},
+    {"sym": "BNB",  "pair": "BNBUSDT"},
+    {"sym": "XRP",  "pair": "XRPUSDT"},
+    {"sym": "ADA",  "pair": "ADAUSDT"},
+    {"sym": "AVAX", "pair": "AVAXUSDT"},
+    {"sym": "LINK", "pair": "LINKUSDT"},
+    {"sym": "DOT",  "pair": "DOTUSDT"},
+    {"sym": "UNI",  "pair": "UNIUSDT"},
 ]
+
+BINANCE = "https://api.binance.com/api/v3"
 
 cache = {
     "data": None,
@@ -83,19 +85,27 @@ def signal_from_indicators(rsi, macd, change_24h):
     return "NEUTRAL"
 
 
-def fetch_market_data():
-    ids = ",".join(c["id"] for c in COINS)
-    url = (
-        f"https://api.coingecko.com/api/v3/coins/markets"
-        f"?vs_currency=usd&ids={ids}&order=market_cap_desc"
-        f"&sparkline=true&price_change_percentage=24h"
-    )
-    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-    r = requests.get(url, timeout=25, headers=headers)
-    if r.status_code == 429:
-        raise Exception("CoinGecko rate limit - zkus to za minutu")
+def fetch_binance_ticker(pair):
+    """24h price stats from Binance."""
+    r = requests.get(f"{BINANCE}/ticker/24hr", params={"symbol": pair}, timeout=10)
     r.raise_for_status()
-    return {item["id"]: item for item in r.json()}
+    d = r.json()
+    return {
+        "price": float(d["lastPrice"]),
+        "change_24h": round(float(d["priceChangePercent"]), 2),
+        "volume": float(d["quoteVolume"]),
+    }
+
+
+def fetch_binance_klines(pair, interval="4h", limit=50):
+    """OHLCV candles — closing prices for RSI/MACD."""
+    r = requests.get(
+        f"{BINANCE}/klines",
+        params={"symbol": pair, "interval": interval, "limit": limit},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return [float(c[4]) for c in r.json()]
 
 
 def fetch_fear_greed():
@@ -105,108 +115,30 @@ def fetch_fear_greed():
     return {"value": int(d["value"]), "label": d["value_classification"]}
 
 
-def fetch_tv_signal(tv_symbol):
-    """
-    Pulls TradingView technical analysis summary via tradingview-screener public API.
-    Returns buy/sell/neutral counts and recommendation string.
-    """
+def fetch_tv_signal(pair):
+    """TradingView technical analysis via public scanner API."""
     try:
-        payload = {
-            "symbols": {"tickers": [tv_symbol]},
-            "columns": [
-                "Recommend.All",
-                "Recommend.MA",
-                "Recommend.Other",
-            ],
-        }
+        symbol = f"BINANCE:{pair}"
         r = requests.post(
             "https://scanner.tradingview.com/crypto/scan",
-            json=payload,
-            timeout=10,
+            json={"symbols": {"tickers": [symbol]}, "columns": ["Recommend.All"]},
             headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
         )
         if r.status_code == 200:
             data = r.json().get("data", [])
             if data:
-                vals = data[0].get("d", [None, None, None])
-                rec = vals[0]
-                if rec is None:
-                    return {"tv_rec": "N/A", "tv_score": 0}
-                score = round(rec, 2)
-                if score >= 0.5:
-                    label = "Strong buy"
-                elif score >= 0.1:
-                    label = "Buy"
-                elif score <= -0.5:
-                    label = "Strong sell"
-                elif score <= -0.1:
-                    label = "Sell"
-                else:
-                    label = "Neutral"
-                return {"tv_rec": label, "tv_score": score}
+                score = data[0].get("d", [None])[0]
+                if score is not None:
+                    if score >= 0.5:   label = "Strong buy"
+                    elif score >= 0.1: label = "Buy"
+                    elif score <= -0.5: label = "Strong sell"
+                    elif score <= -0.1: label = "Sell"
+                    else:              label = "Neutral"
+                    return {"tv_rec": label, "tv_score": round(score, 2)}
     except Exception:
         pass
     return {"tv_rec": "N/A", "tv_score": 0}
-
-
-def fetch_tv_ideas(symbol_name):
-    """
-    Fetches community ideas from TradingView for a symbol.
-    Uses the tradingview-scraper compatible public endpoint.
-    """
-    try:
-        url = f"https://www.tradingview.com/symbols/{symbol_name}USD/ideas/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        api_url = f"https://www.tradingview.com/ideas/page-1/?symbol={symbol_name}USD&sort=popularity&type=1"
-        r = requests.get(api_url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            ideas = r.json() if r.headers.get("content-type", "").startswith("application/json") else []
-            if isinstance(ideas, list) and ideas:
-                bull = sum(1 for i in ideas[:20] if i.get("agree_count", 0) > i.get("disagree_count", 0))
-                bear = len(ideas[:20]) - bull
-                return {"bull": bull, "bear": bear, "total": len(ideas[:20])}
-    except Exception:
-        pass
-    return {"bull": 0, "bear": 0, "total": 0}
-
-
-def ask_claude(market_summary):
-    if not ANTHROPIC_API_KEY:
-        return "Nastavte ANTHROPIC_API_KEY pro AI analýzu."
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 600,
-                "system": (
-                    "Jsi krypto analytik. Píšeš stručně v češtině. "
-                    "Na základě dat dej jasný přehled trhu (2-3 věty), "
-                    "pak 2-3 konkrétní tipy s LONG/SHORT signálem a důvodem (1 věta každý). "
-                    "Žádné obecné výhrady, jen konkrétní analýza."
-                ),
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"Aktuální tržní data:\n{market_summary}\n\nZhodnoť trh a dej konkrétní doporučení.",
-                    }
-                ],
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()["content"][0]["text"]
-    except Exception as e:
-        return f"Chyba při volání Claude API: {e}"
 
 
 def refresh_data():
@@ -215,28 +147,25 @@ def refresh_data():
     cache["updating"] = True
     cache["error"] = None
     try:
-        market = fetch_market_data()
         fg = fetch_fear_greed()
-
         coins_out = []
         summary_lines = []
 
         for coin in COINS:
-            cid = coin["id"]
             sym = coin["sym"]
-            if cid not in market:
+            pair = coin["pair"]
+            try:
+                ticker = fetch_binance_ticker(pair)
+                closes = fetch_binance_klines(pair, interval="4h", limit=50)
+            except Exception as e:
                 continue
-            m = market[cid]
-            spark = (m.get("sparkline_in_7d") or {}).get("price", [])
-            prices = spark[-30:] if len(spark) >= 15 else spark
 
-            rsi = calc_rsi(prices) if len(prices) >= 15 else 50.0
-            macd = calc_macd(prices) if len(prices) >= 26 else 0.0
-            chg = round(m.get("price_change_percentage_24h") or 0, 2)
-            price = m.get("current_price", 0)
-            volume = m.get("total_volume", 0)
+            rsi = calc_rsi(closes) if len(closes) >= 15 else 50.0
+            macd = calc_macd(closes) if len(closes) >= 26 else 0.0
+            price = ticker["price"]
+            chg = ticker["change_24h"]
 
-            tv = fetch_tv_signal(coin["tv"])
+            tv = fetch_tv_signal(pair)
             signal = signal_from_indicators(rsi, macd, chg)
 
             coins_out.append({
@@ -248,16 +177,13 @@ def refresh_data():
                 "signal": signal,
                 "tv_rec": tv["tv_rec"],
                 "tv_score": tv["tv_score"],
-                "volume": volume,
-                "market_cap": m.get("market_cap", 0),
+                "volume": ticker["volume"],
             })
 
             summary_lines.append(
-                f"{sym}: ${price:,.2f}, 24h={chg:+.1f}%, RSI={rsi}, "
+                f"{sym}: ${price:,.4f}, 24h={chg:+.1f}%, RSI={rsi}, "
                 f"MACD={'↑' if macd > 0 else '↓'}, TV={tv['tv_rec']}, signal={signal}"
             )
-
-            time.sleep(0.3)
 
         market_summary = "\n".join(summary_lines)
         market_summary += f"\nFear & Greed: {fg['value']} ({fg['label']})"
@@ -268,7 +194,6 @@ def refresh_data():
             "coins": coins_out,
             "fear_greed": fg,
             "ai_analysis": ai_analysis,
-            "btc_dominance": None,
         }
         cache["updated_at"] = datetime.now(timezone.utc).isoformat()
 
