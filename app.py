@@ -21,7 +21,19 @@ COINS = [
     {"sym": "UNI",  "pair": "UNIUSDT"},
 ]
 
-BINANCE = "https://api.binance.com/api/v3"
+KRAKEN_API = "https://api.kraken.com/0/public"
+KRAKEN_PAIRS = {
+    "BTCUSDT": "XBTUSD",
+    "ETHUSDT": "ETHUSD",
+    "SOLUSDT": "SOLUSD",
+    "BNBUSDT": "BNBUSD",
+    "XRPUSDT": "XRPUSD",
+    "ADAUSDT": "ADAUSD",
+    "AVAXUSDT": "AVAXUSD",
+    "LINKUSDT": "LINKUSD",
+    "DOTUSDT": "DOTUSD",
+    "UNIUSDT": "UNIUSD",
+}
 
 cache = {
     "data": None,
@@ -85,27 +97,43 @@ def signal_from_indicators(rsi, macd, change_24h):
     return "NEUTRAL"
 
 
-def fetch_binance_ticker(pair):
-    """24h price stats from Binance."""
-    r = requests.get(f"{BINANCE}/ticker/24hr", params={"symbol": pair}, timeout=10)
-    r.raise_for_status()
-    d = r.json()
-    return {
-        "price": float(d["lastPrice"]),
-        "change_24h": round(float(d["priceChangePercent"]), 2),
-        "volume": float(d["quoteVolume"]),
-    }
-
-
-def fetch_binance_klines(pair, interval="4h", limit=50):
-    """OHLCV candles — closing prices for RSI/MACD."""
+def fetch_ticker(pair):
+    """24h price stats from Kraken."""
+    kraken_pair = KRAKEN_PAIRS.get(pair, pair.replace("USDT", "USD"))
     r = requests.get(
-        f"{BINANCE}/klines",
-        params={"symbol": pair, "interval": interval, "limit": limit},
+        f"{KRAKEN_API}/Ticker",
+        params={"pair": kraken_pair},
         timeout=10,
+        headers={"User-Agent": "Mozilla/5.0"},
     )
     r.raise_for_status()
-    return [float(c[4]) for c in r.json()]
+    result = r.json().get("result", {})
+    if not result:
+        raise Exception(f"No data for {kraken_pair}")
+    d = list(result.values())[0]
+    price = float(d["c"][0])
+    open_price = float(d["o"])
+    change_24h = round((price - open_price) / open_price * 100, 2) if open_price else 0
+    volume = float(d["v"][1])
+    return {"price": price, "change_24h": change_24h, "volume": volume}
+
+
+def fetch_klines(pair, interval=240, limit=50):
+    """OHLCV candles from Kraken — closing prices for RSI/MACD."""
+    kraken_pair = KRAKEN_PAIRS.get(pair, pair.replace("USDT", "USD"))
+    r = requests.get(
+        f"{KRAKEN_API}/OHLC",
+        params={"pair": kraken_pair, "interval": interval},
+        timeout=10,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    r.raise_for_status()
+    result = r.json().get("result", {})
+    candles = [v for k, v in result.items() if k != "last"]
+    if not candles:
+        raise Exception(f"No candles for {kraken_pair}")
+    closes = [float(c[4]) for c in candles[0][-limit:]]
+    return closes
 
 
 def fetch_fear_greed():
@@ -153,7 +181,7 @@ def ask_claude(market_summary):
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 600,
                 "system": (
                     "Jsi krypto analytik. Pises strucne v cestine. "
@@ -185,8 +213,8 @@ def refresh_data():
             sym = coin["sym"]
             pair = coin["pair"]
             try:
-                ticker = fetch_binance_ticker(pair)
-                closes = fetch_binance_klines(pair, interval="4h", limit=50)
+                ticker = fetch_ticker(pair)
+                closes = fetch_klines(pair, interval=240, limit=50)
             except Exception as e:
                 continue
 
