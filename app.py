@@ -91,19 +91,11 @@ def fetch_market_data():
         f"&sparkline=true&price_change_percentage=24h"
     )
     headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
-    for attempt in range(3):
-        try:
-            r = requests.get(url, timeout=30, headers=headers)
-            if r.status_code == 429:
-                time.sleep(20 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            return {item["id"]: item for item in r.json()}
-        except requests.exceptions.RequestException:
-            if attempt == 2:
-                raise
-            time.sleep(10)
-    raise Exception("CoinGecko API nedostupne")
+    r = requests.get(url, timeout=25, headers=headers)
+    if r.status_code == 429:
+        raise Exception("CoinGecko rate limit - zkus to za minutu")
+    r.raise_for_status()
+    return {item["id"]: item for item in r.json()}
 
 
 def fetch_fear_greed():
