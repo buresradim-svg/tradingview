@@ -141,6 +141,36 @@ def fetch_tv_signal(pair):
     return {"tv_rec": "N/A", "tv_score": 0}
 
 
+def ask_claude(market_summary):
+    if not ANTHROPIC_API_KEY:
+        return "Nastavte ANTHROPIC_API_KEY pro AI analyzu."
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 600,
+                "system": (
+                    "Jsi krypto analytik. Pises strucne v cestine. "
+                    "Na zaklade dat dej jasny prehled trhu (2-3 vety), "
+                    "pak 2-3 konkretni tipy s LONG/SHORT signalem a duvodem (1 veta kazdy). "
+                    "Zadne obecne vyhrady, jen konkretni analyza."
+                ),
+                "messages": [{"role": "user", "content": f"Aktualni trzni data:\n{market_summary}\n\nZhodnot trh a dej konkretni doporuceni."}],
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()["content"][0]["text"]
+    except Exception as e:
+        return f"Chyba pri volani Claude API: {e}"
+
+
 def refresh_data():
     if cache["updating"]:
         return
