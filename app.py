@@ -430,21 +430,35 @@ def refresh_stocks():
 # ════════════════════════════════════════════════════════════════════════════
 
 T212_KEY = os.environ.get("T212_API_KEY", "")
+T212_SECRET = os.environ.get("T212_API_SECRET", "")
 T212_BASE = "https://live.trading212.com/api/v0"
 
 def t212_get(path):
-    """Make authenticated GET request to Trading 212 API."""
+    """Make authenticated GET request to Trading 212 API.
+    Supports both Basic Auth (key+secret) and direct token.
+    """
+    import base64
     if not T212_KEY:
-        raise Exception("Chybí T212_API_KEY v environment variables")
+        raise Exception("Chybi T212_API_KEY v environment variables")
+    if T212_SECRET:
+        creds = base64.b64encode(f"{T212_KEY}:{T212_SECRET}".encode()).decode()
+        auth_header = f"Basic {creds}"
+    else:
+        auth_header = T212_KEY
     r = requests.get(
         f"{T212_BASE}{path}",
-        headers={"Authorization": T212_KEY},
+        headers={"Authorization": auth_header},
         timeout=15,
     )
     if r.status_code == 401:
-        raise Exception("Neplatný T212 API klíč")
+        if T212_SECRET:
+            raise Exception("Neplatny T212 klic nebo secret — zkontroluj T212_API_KEY a T212_API_SECRET v Renderu")
+        else:
+            raise Exception("Neplatny T212 klic — pokud mas i API Secret, pridej ho jako T212_API_SECRET v Renderu")
+    if r.status_code == 403:
+        raise Exception("T212 API: nemas opravneni — ucet musi byt Invest nebo ISA, ne CFD")
     if r.status_code == 429:
-        raise Exception("Trading 212 rate limit — zkus za chvíli")
+        raise Exception("Trading 212 rate limit — zkus za chvili")
     r.raise_for_status()
     return r.json()
 
