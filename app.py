@@ -1085,6 +1085,19 @@ def api_stocks_refresh():
     return jsonify({"ok": True})
 
 
+@app.route("/api/debug/positions")
+def api_debug_positions():
+    """Shows raw T212 positions data — first 2 positions only."""
+    if not T212_KEY:
+        return jsonify({"error": "No T212_API_KEY"})
+    try:
+        raw = t212_get("/equity/positions")
+        positions = raw if isinstance(raw, list) else raw.get("items", [])
+        return jsonify({"first_two": positions[:2], "total": len(positions)})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route("/api/debug/pies-list")
 def api_debug_pies_list():
     """Shows raw T212 pie LIST (no detail calls, no rate limit issues)."""
