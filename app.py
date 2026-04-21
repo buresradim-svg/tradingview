@@ -1096,6 +1096,18 @@ def api_stocks_refresh():
     return jsonify({"ok": True})
 
 
+@app.route("/api/debug/pies-list")
+def api_debug_pies_list():
+    """Shows raw T212 pie LIST (no detail calls, no rate limit issues)."""
+    if not T212_KEY:
+        return jsonify({"error": "No T212_API_KEY"})
+    try:
+        pies_raw = t212_get("/equity/pies")
+        return jsonify({"raw": pies_raw})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route("/api/debug/pies")
 def api_debug_pies():
     """Temporary debug endpoint - shows raw T212 pie data to diagnose name fields."""
