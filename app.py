@@ -314,50 +314,76 @@ def fetch_patria_recommendations():
     }
 
 
-def fetch_yahoo_recommendations(symbols):
+def fetch_finnhub_recommendations(symbols):
+    """Fetch analyst recommendations + price from Finnhub free API."""
+    api_key = os.environ.get("FINNHUB_API_KEY", "")
+    if not api_key:
+        return [{"sym": s, "name": s, "price": None, "change_24h": 0,
+                 "rec": "Chybí FINNHUB_API_KEY", "target": None,
+                 "potential": None, "analysts": 0} for s in symbols[:3]]
+
     results = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+    headers = {"X-Finnhub-Token": api_key}
+
     for sym in symbols:
         try:
-            # Price + basic info
-            r1 = requests.get(
-                f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}",
-                params={"interval": "1d", "range": "2d"},
-                headers=headers, timeout=12,
+            # Quote (price, change)
+            rq = requests.get(
+                f"https://finnhub.io/api/v1/quote",
+                params={"symbol": sym, "token": api_key},
+                timeout=10,
             )
-            if r1.status_code != 200:
-                continue
-            meta = r1.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
-            price = meta.get("regularMarketPrice")
-            prev = meta.get("chartPreviousClose") or meta.get("regularMarketPreviousClose")
+            quote = rq.json() if rq.status_code == 200 else {}
+            price = quote.get("c")
+            prev = quote.get("pc")
             chg = round((price - prev) / prev * 100, 2) if price and prev else 0
-            name = meta.get("longName") or meta.get("shortName") or sym
 
-            # Analyst data
-            r2 = requests.get(
-                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}",
-                params={"modules": "financialData"},
-                headers=headers, timeout=12,
+            # Company profile (name)
+            rp = requests.get(
+                f"https://finnhub.io/api/v1/stock/profile2",
+                params={"symbol": sym, "token": api_key},
+                timeout=10,
             )
-            rec_label, target, potential, analysts = "N/A", None, None, 0
-            if r2.status_code == 200:
-                fin = r2.json().get("quoteSummary", {}).get("result", [{}])[0].get("financialData", {})
-                rec_key = fin.get("recommendationKey", "")
-                target_r = fin.get("targetMeanPrice", {})
-                target = target_r.get("raw") if isinstance(target_r, dict) else None
-                ana_r = fin.get("numberOfAnalystOpinions", {})
-                analysts = ana_r.get("raw", 0) if isinstance(ana_r, dict) else 0
-                label_map = {
-                    "strong_buy": "Strong buy", "buy": "Buy", "hold": "Hold",
-                    "underperform": "Underperform", "sell": "Sell",
-                }
-                if rec_key:
-                    rec_label = label_map.get(rec_key, rec_key.replace("_", " ").title())
+            profile = rp.json() if rp.status_code == 200 else {}
+            name = profile.get("name") or sym
+
+            # Recommendation trends
+            rr = requests.get(
+                f"https://finnhub.io/api/v1/stock/recommendation",
+                params={"symbol": sym, "token": api_key},
+                timeout=10,
+            )
+            rec_label = "N/A"
+            analysts = 0
+            if rr.status_code == 200:
+                trends = rr.json()
+                if trends:
+                    latest = trends[0]
+                    strong_buy = latest.get("strongBuy", 0)
+                    buy = latest.get("buy", 0)
+                    hold = latest.get("hold", 0)
+                    sell = latest.get("sell", 0)
+                    strong_sell = latest.get("strongSell", 0)
+                    analysts = strong_buy + buy + hold + sell + strong_sell
+                    if analysts > 0:
+                        score = (strong_buy * 1 + buy * 2 + hold * 3 + sell * 4 + strong_sell * 5) / analysts
+                        if score <= 1.5:    rec_label = "Strong buy"
+                        elif score <= 2.5:  rec_label = "Buy"
+                        elif score <= 3.5:  rec_label = "Hold"
+                        elif score <= 4.5:  rec_label = "Sell"
+                        else:               rec_label = "Strong sell"
+
+            # Price target
+            rt = requests.get(
+                f"https://finnhub.io/api/v1/stock/price-target",
+                params={"symbol": sym, "token": api_key},
+                timeout=10,
+            )
+            target = None
+            potential = None
+            if rt.status_code == 200:
+                pt = rt.json()
+                target = pt.get("targetMean")
                 if target and price:
                     potential = round((target - price) / price * 100, 1)
 
@@ -371,11 +397,11 @@ def fetch_yahoo_recommendations(symbols):
                     "potential": potential,
                     "analysts": analysts,
                 })
-            time.sleep(0.4)
+            time.sleep(0.15)
         except Exception:
             continue
 
-    order = {"strong buy": 0, "buy": 1, "hold": 2, "underperform": 3, "sell": 4, "n/a": 5}
+    order = {"strong buy": 0, "buy": 1, "hold": 2, "sell": 3, "strong sell": 4, "n/a": 5}
     results.sort(key=lambda x: order.get(x.get("rec", "").lower(), 5))
     return results
 
@@ -388,7 +414,7 @@ def refresh_stocks():
     stocks_cache["patria_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
-        stocks_cache["world"] = fetch_yahoo_recommendations(US_STOCKS)
+        stocks_cache["world"] = fetch_finnhub_recommendations(US_STOCKS)
     except Exception:
         stocks_cache["world"] = []
     stocks_cache["world_at"] = datetime.now(timezone.utc).isoformat()
