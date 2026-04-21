@@ -465,29 +465,31 @@ def t212_get(path):
 
 def fetch_t212_portfolio():
     """Fetch all positions + pies from Trading 212."""
-    # Account cash & totals
-    cash_data = t212_get("/equity/account/cash")
+    # Account summary - has currency, totalValue, investments breakdown
+    summary = t212_get("/equity/account/summary")
     
-    # All open positions
-    positions_raw = t212_get("/equity/portfolio")
+    # All open positions - returns list directly
+    positions_raw = t212_get("/equity/positions")
     positions = positions_raw if isinstance(positions_raw, list) else positions_raw.get("items", [])
 
-    # All pies
+    # All pies - list with basic info
     pies_raw = t212_get("/equity/pies")
-    pies = pies_raw if isinstance(pies_raw, list) else pies_raw.get("items", [])
+    pies_list = pies_raw if isinstance(pies_raw, list) else pies_raw.get("items", [])
     
-    # Enrich each pie with its detail (slices)
+    # Enrich each pie with detail (has settings.name, instruments, result)
     pies_detail = []
-    for pie in pies[:10]:  # limit to 10 pies
+    for pie in pies_list[:15]:
         try:
             pie_id = pie.get("id")
             detail = t212_get(f"/equity/pies/{pie_id}")
+            # Merge list-level data into detail
+            detail["_list_data"] = pie
             pies_detail.append(detail)
         except Exception:
             pies_detail.append(pie)
 
     return {
-        "cash": cash_data,
+        "summary": summary,
         "positions": positions,
         "pies": pies_detail,
     }
@@ -503,7 +505,7 @@ def enrich_with_finnhub(positions):
         sym = ticker_raw.split("_")[0] if "_" in ticker_raw else ticker_raw
         
         rec_label, target, analysts = "N/A", None, 0
-        current_price = pos.get("currentPrice") or pos.get("currentPriceInAccountCurrency")
+        current_price = pos.get("currentPrice")  # price in instrument's own currency
         
         if api_key and sym:
             try:
@@ -540,11 +542,9 @@ def enrich_with_finnhub(positions):
             except Exception:
                 pass
 
-        avg_price = (pos.get("averagePrice") or pos.get("averagePricePaid") or
-                     pos.get("avgPrice") or 0)
+        avg_price = pos.get("averagePricePaid") or pos.get("averagePrice") or 0
         quantity = pos.get("quantity", 0)
-        current = (pos.get("currentPrice") or pos.get("currentPriceInAccountCurrency") or
-                   current_price or avg_price)
+        current = pos.get("currentPrice") or avg_price
         invested = avg_price * quantity if avg_price and quantity else 0
         current_val = current * quantity if current and quantity else invested
         pnl = current_val - invested if invested else 0
@@ -554,7 +554,7 @@ def enrich_with_finnhub(positions):
         enriched.append({
             "ticker": ticker_raw,
             "sym": sym,
-            "name": pos.get("fullName") or pos.get("name") or sym,
+            "name": (pos.get("instrument") or {}).get("name") or pos.get("fullName") or pos.get("name") or sym,
             "quantity": round(quantity, 4) if quantity else 0,
             "avg_price": round(avg_price, 4) if avg_price else 0,
             "current_price": round(current, 4) if current else 0,
@@ -566,7 +566,7 @@ def enrich_with_finnhub(positions):
             "target": round(target, 2) if target else None,
             "potential": potential,
             "analysts": analysts,
-            "in_pie": (pos.get("pieQuantity") or pos.get("quantityInPies") or 0) > 0,
+            "in_pie": (pos.get("quantityInPies") or 0) > 0,
         })
     return enriched
 
@@ -632,28 +632,43 @@ def refresh_portfolio():
     try:
         raw = fetch_t212_portfolio()
         positions = raw["positions"]
-        cash = raw["cash"]
+        summary = raw["summary"]
         pies = raw["pies"]
         
-        # Enrich positions with Finnhub data (limit to 20 to stay in rate limits)
+        # Extract currency and key metrics from summary
+        currency = summary.get("currency", "USD")
+        curr_sym = currency  # show actual currency code
+        investments = summary.get("investments") or {}
+        total_value = summary.get("totalValue") or 0
+        total_invested = investments.get("totalCost") or 0
+        unrealized_pnl = investments.get("unrealizedProfitLoss") or 0
+        cash_avail = (summary.get("cash") or {}).get("availableToTrade") or 0
+
+        # Build cash_info for Claude
+        cash_info = {
+            "free": cash_avail,
+            "total": total_value,
+            "currency": currency,
+        }
+        
+        # Enrich positions with Finnhub data (limit to 20)
         enriched = enrich_with_finnhub(positions[:20])
         
         # Get Claude analysis
-        ai = ask_claude_portfolio(enriched, cash)
+        ai = ask_claude_portfolio(enriched, cash_info)
         
         # Process pies summary
         pies_summary = []
         for pie in pies:
             settings = pie.get("settings") or {}
             result = pie.get("result") or {}
+            list_data = pie.get("_list_data") or {}
             instruments = pie.get("instruments") or []
-            pie_id = pie.get("id") or settings.get("id") or ""
-            # Name: settings.name is the user-defined name (may be absent in API response)
-            # Fall back to settings.id or numeric ID
+            pie_id = pie.get("id") or settings.get("id") or list_data.get("id") or ""
             name = (settings.get("name") or "").strip()
             if not name:
                 name = f"Kola\u010d {pie_id}"
-            # Values from correct API fields
+            # result fields from detailed endpoint
             value = result.get("priceAvgValue") or 0
             invested = result.get("priceAvgInvestedValue") or 0
             pnl_abs = result.get("priceAvgResult") or 0
@@ -667,12 +682,20 @@ def refresh_portfolio():
                 "pnl": round(pnl_abs, 2),
                 "pnl_pct": pnl_pct,
                 "slices": len(instruments),
+                "currency": currency,
             })
         
         portfolio_cache["data"] = {
             "positions": enriched,
             "pies": pies_summary,
-            "cash": cash,
+            "cash": cash_info,
+            "summary": {
+                "total_value": round(total_value, 2),
+                "total_invested": round(total_invested, 2),
+                "unrealized_pnl": round(unrealized_pnl, 2),
+                "cash_free": round(cash_avail, 2),
+                "currency": currency,
+            },
             "ai_analysis": ai,
         }
         portfolio_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -951,19 +974,18 @@ async function loadPortfolio(force){
     }
     document.getElementById('p-content').style.display='block';
 
-    // Summary metrics
-    const cash=d.cash||{};
-    const positions=d.positions||[];
-    const totalVal=positions.reduce((s,p)=>s+(p.current_val||0),0)+(cash.free||0);
-    const totalInv=positions.reduce((s,p)=>s+(p.invested||0),0);
-    const totalPnl=totalVal-(totalInv+(cash.free||0));
-    const pnlPct=totalInv>0?((totalPnl/totalInv)*100).toFixed(1):0;
-    document.getElementById('p-total').textContent=fmtVal(totalVal);
-    document.getElementById('p-invested').textContent=fmtVal(totalInv);
+    // Summary metrics - use pre-computed summary from API
+    const summ=d.summary||{};
+    const curr=summ.currency||'';
+    function fmtCurr(n){if(!n&&n!==0)return'—';const abs=Math.abs(n);const formatted=abs>=10000?abs.toLocaleString('cs-CZ',{maximumFractionDigits:0}):(abs>=1?abs.toFixed(2):abs.toFixed(4));return(n<0?'-':'')+formatted+' '+curr;}
+    document.getElementById('p-total').textContent=fmtCurr(summ.total_value);
+    document.getElementById('p-invested').textContent=fmtCurr(summ.total_invested);
+    const pnl=summ.unrealized_pnl||0;
+    const pnlPct=summ.total_invested>0?((pnl/summ.total_invested)*100).toFixed(1):0;
     const pnlEl=document.getElementById('p-pnl');
-    pnlEl.textContent=(totalPnl>=0?'+':'')+fmtVal(totalPnl)+' ('+pnlPct+'%)';
-    pnlEl.style.color=totalPnl>=0?'var(--green)':'var(--red)';
-    document.getElementById('p-cash').textContent=fmtVal(cash.free||cash.cash||0);
+    pnlEl.textContent=(pnl>=0?'+':'')+fmtCurr(pnl)+' ('+pnlPct+'%)';
+    pnlEl.style.color=pnl>=0?'var(--green)':'var(--red)';
+    document.getElementById('p-cash').textContent=fmtCurr(summ.cash_free);
 
     // Pies
     const pies=d.pies||[];
@@ -972,8 +994,10 @@ async function loadPortfolio(force){
       let pr='';
       for(const p of pies){
         const pc=(p.pnl_pct||0)>=0?'up':'dn';
-        const pnlStr=(p.pnl!=null&&p.pnl!==0)?` (${ p.pnl>=0?'+':'' }$${Math.abs(p.pnl).toFixed(0)})`:'';
-        pr+=`<tr><td><strong>${p.name}</strong></td><td>${fmtVal(p.value)}</td><td>${fmtVal(p.invested)}</td><td class="${pc}">${(p.pnl_pct>=0?'+':'')+p.pnl_pct}%${pnlStr}</td><td style="color:var(--muted)">${p.slices} titulů</td></tr>`;
+        const c=p.currency||summ.currency||'';
+        function fmtP(n){if(!n&&n!==0)return'—';return Math.abs(n).toLocaleString('cs-CZ',{maximumFractionDigits:0})+' '+c;}
+        const pnlStr=(p.pnl!=null&&p.pnl!==0)?` (${ p.pnl>=0?'+':'' }${fmtP(p.pnl)})`:'';
+        pr+=`<tr><td><strong>${p.name}</strong></td><td>${fmtP(p.value)}</td><td>${fmtP(p.invested)}</td><td class="${pc}">${(p.pnl_pct>=0?'+':'')+p.pnl_pct}%${pnlStr}</td><td style="color:var(--muted)">${p.slices} titulů</td></tr>`;
       }
       document.getElementById('pies-tb').innerHTML=pr;
     }
