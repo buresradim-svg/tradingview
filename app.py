@@ -1,191 +1,45 @@
 import os
+import re
 import time
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
+# ── Crypto config ────────────────────────────────────────────────────────────
 COINS = [
-    {"id": "bitcoin",       "sym": "BTC",  "tv": "BINANCE:BTCUSDT"},
-    {"id": "ethereum",      "sym": "ETH",  "tv": "BINANCE:ETHUSDT"},
-    {"id": "solana",        "sym": "SOL",  "tv": "BINANCE:SOLUSDT"},
-    {"id": "binancecoin",   "sym": "BNB",  "tv": "BINANCE:BNBUSDT"},
-    {"id": "ripple",        "sym": "XRP",  "tv": "BINANCE:XRPUSDT"},
-    {"id": "cardano",       "sym": "ADA",  "tv": "BINANCE:ADAUSDT"},
-    {"id": "avalanche-2",   "sym": "AVAX", "tv": "BINANCE:AVAXUSDT"},
-    {"id": "chainlink",     "sym": "LINK", "tv": "BINANCE:LINKUSDT"},
-    {"id": "polkadot",      "sym": "DOT",  "tv": "BINANCE:DOTUSDT"},
-    {"id": "uniswap",       "sym": "UNI",  "tv": "BINANCE:UNIUSDT"},
+    {"sym": "BTC",  "pair": "XBTUSD"},
+    {"sym": "ETH",  "pair": "ETHUSD"},
+    {"sym": "SOL",  "pair": "SOLUSD"},
+    {"sym": "BNB",  "pair": "BNBUSD"},
+    {"sym": "XRP",  "pair": "XRPUSD"},
+    {"sym": "ADA",  "pair": "ADAUSD"},
+    {"sym": "AVAX", "pair": "AVAXUSD"},
+    {"sym": "LINK", "pair": "LINKUSD"},
+    {"sym": "DOT",  "pair": "DOTUSD"},
+    {"sym": "UNI",  "pair": "UNIUSD"},
 ]
+KRAKEN = "https://api.kraken.com/0/public"
 
-cache = {
-    "data": None,
-    "updated_at": None,
-    "updating": False,
-    "error": None,
-}
-
-# ── Stocks cache ────────────────────────────────────────────────────────────
-stocks_cache = {
-    "patria": None,
-    "world": None,
-    "patria_at": None,
-    "world_at": None,
-}
-
+# ── Stocks config ────────────────────────────────────────────────────────────
 US_STOCKS = [
-    "NVDA","MSFT","AAPL","AMZN","GOOGL","META","TSLA","JPM","V","JNJ",
-    "WMT","XOM","UNH","MA","HD","NFLX","PYPL","INTC","AMD","DIS",
+    "NVDA", "MSFT", "AAPL", "AMZN", "GOOGL",
+    "META", "TSLA", "JPM", "V", "JNJ",
+    "WMT", "XOM", "UNH", "HD", "NFLX",
+    "PYPL", "INTC", "AMD", "DIS", "AMGN",
 ]
 
-def fetch_patria_recommendations():
-    """Scrape Patria.cz doporučení pro české a světové akcie."""
-    url = "https://www.patria.cz/akcie/vyzkum/doporuceni.html"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "cs-CZ,cs;q=0.9",
-    }
-    r = requests.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
-    html = r.text
-
-    results_cz = []
-    results_world = []
-
-    # Parse Czech recommendations table
-    import re
-    # Find "Patria - Investiční doporučení - ČR" section
-    cz_match = re.search(
-        r'Patria - Investiční doporučení - ČR.*?<table[^>]*>(.*?)</table>',
-        html, re.DOTALL
-    )
-    if cz_match:
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', cz_match.group(1), re.DOTALL)
-        for row in rows:
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-            if len(cells) >= 5:
-                name = re.sub(r'<[^>]+>', '', cells[0]).strip()
-                rec_new = re.sub(r'<[^>]+>', '', cells[1]).strip()
-                rec_old = re.sub(r'<[^>]+>', '', cells[2]).strip()
-                price_cur = re.sub(r'<[^>]+>', '', cells[3]).strip().replace('\xa0', ' ')
-                price_target = re.sub(r'<[^>]+>', '', cells[4]).strip().replace('\xa0', ' ')
-                potential = re.sub(r'<[^>]+>', '', cells[5]).strip() if len(cells) > 5 else ''
-                if name and rec_new and name not in ('Název CP', ''):
-                    results_cz.append({
-                        "name": name,
-                        "rec": rec_new,
-                        "rec_prev": rec_old,
-                        "price": price_cur,
-                        "target": price_target,
-                        "potential": potential,
-                        "source": "Patria",
-                    })
-
-    # Parse "Monitoring investičních doporučení" - global banks
-    monitor_match = re.search(
-        r'Monitoring investičních doporučení.*?<table[^>]*>(.*?)</table>',
-        html, re.DOTALL
-    )
-    if monitor_match:
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', monitor_match.group(1), re.DOTALL)
-        for row in rows:
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-            if len(cells) >= 4:
-                name = re.sub(r'<[^>]+>', '', cells[0]).strip()
-                company = re.sub(r'<[^>]+>', '', cells[1]).strip()
-                rec_new = re.sub(r'<[^>]+>', '', cells[2]).strip()
-                target_raw = re.sub(r'<[^>]+>', '', cells[4]).strip() if len(cells) > 4 else ''
-                currency = re.sub(r'<[^>]+>', '', cells[5]).strip() if len(cells) > 5 else ''
-                if name and rec_new and name not in ('Název CP', ''):
-                    results_world.append({
-                        "name": name,
-                        "analyst": company,
-                        "rec": rec_new,
-                        "target": f"{target_raw} {currency}".strip(),
-                        "source": "Patria/monitoring",
-                    })
-
-    return {
-        "cz": results_cz[:20],
-        "world_monitor": results_world[:20],
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-    }
+# ── Caches ───────────────────────────────────────────────────────────────────
+crypto_cache = {"data": None, "updated_at": None, "updating": False, "error": None}
+stocks_cache = {"patria": None, "world": None, "patria_at": None, "world_at": None}
 
 
-def fetch_yahoo_recommendations(symbols):
-    """Fetch analyst recommendations from Yahoo Finance."""
-    results = []
-    for sym in symbols:
-        try:
-            url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{sym}"
-            params = {"modules": "financialData,price"}
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "application/json",
-            }
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-            if r.status_code != 200:
-                continue
-            d = r.json().get("quoteSummary", {}).get("result", [{}])[0]
-            fin = d.get("financialData", {})
-            price_data = d.get("price", {})
-
-            rec_mean = fin.get("recommendationMean", {}).get("raw")
-            rec_key = fin.get("recommendationKey", "")
-            target = fin.get("targetMeanPrice", {}).get("raw")
-            current = fin.get("currentPrice", {}).get("raw") or                       price_data.get("regularMarketPrice", {}).get("raw")
-            num_analysts = fin.get("numberOfAnalystOpinions", {}).get("raw", 0)
-            name = price_data.get("longName") or price_data.get("shortName") or sym
-            chg = price_data.get("regularMarketChangePercent", {}).get("raw", 0)
-
-            if rec_key:
-                label_map = {
-                    "strong_buy": "Strong buy", "buy": "Buy",
-                    "hold": "Hold", "underperform": "Underperform",
-                    "sell": "Sell",
-                }
-                rec_label = label_map.get(rec_key, rec_key.replace("_", " ").title())
-                potential = round((target - current) / current * 100, 1) if target and current else None
-                results.append({
-                    "sym": sym,
-                    "name": name,
-                    "price": round(current, 2) if current else None,
-                    "change_24h": round(chg * 100, 2) if chg else 0,
-                    "rec": rec_label,
-                    "rec_score": round(rec_mean, 2) if rec_mean else None,
-                    "target": round(target, 2) if target else None,
-                    "potential": potential,
-                    "analysts": num_analysts,
-                })
-        except Exception:
-            continue
-    return sorted(results, key=lambda x: x.get("rec_score") or 3)
-
-
-def refresh_stocks():
-    """Refresh both Patria and Yahoo Finance data."""
-    try:
-        patria = fetch_patria_recommendations()
-        stocks_cache["patria"] = patria
-        stocks_cache["patria_at"] = datetime.now(timezone.utc).isoformat()
-    except Exception as e:
-        stocks_cache["patria"] = {"error": str(e), "cz": [], "world_monitor": []}
-
-    try:
-        world = fetch_yahoo_recommendations(US_STOCKS)
-        stocks_cache["world"] = world
-        stocks_cache["world_at"] = datetime.now(timezone.utc).isoformat()
-    except Exception as e:
-        stocks_cache["world"] = []
-
-
-
+# ════════════════════════════════════════════════════════════════════════════
+# CRYPTO FUNCTIONS
+# ════════════════════════════════════════════════════════════════════════════
 
 def calc_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -199,8 +53,7 @@ def calc_rsi(prices, period=14):
     avg_loss = sum(losses) / period
     if avg_loss == 0:
         return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
+    return round(100 - (100 / (1 + avg_gain / avg_loss)), 1)
 
 
 def calc_ema(prices, period):
@@ -221,36 +74,49 @@ def calc_macd(prices):
 
 def signal_from_indicators(rsi, macd, change_24h):
     score = 0
-    if rsi < 35:
-        score += 2
-    elif rsi < 45:
-        score += 1
-    elif rsi > 65:
-        score -= 2
-    elif rsi > 55:
-        score -= 1
+    if rsi < 35:    score += 2
+    elif rsi < 45:  score += 1
+    elif rsi > 65:  score -= 2
+    elif rsi > 55:  score -= 1
     score += (1 if macd > 0 else -1)
-    if change_24h > 4:
-        score += 1
-    elif change_24h < -4:
-        score -= 1
-    if score >= 2:
-        return "LONG"
-    if score <= -2:
-        return "SHORT"
+    if change_24h > 4:    score += 1
+    elif change_24h < -4: score -= 1
+    if score >= 2:  return "LONG"
+    if score <= -2: return "SHORT"
     return "NEUTRAL"
 
 
-def fetch_market_data():
-    ids = ",".join(c["id"] for c in COINS)
-    url = (
-        f"https://api.coingecko.com/api/v3/coins/markets"
-        f"?vs_currency=usd&ids={ids}&order=market_cap_desc"
-        f"&sparkline=true&price_change_percentage=24h"
+def fetch_kraken_ticker(pair):
+    r = requests.get(
+        f"{KRAKEN}/Ticker",
+        params={"pair": pair},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=10,
     )
-    r = requests.get(url, timeout=20)
     r.raise_for_status()
-    return {item["id"]: item for item in r.json()}
+    result = r.json().get("result", {})
+    if not result:
+        raise Exception(f"No ticker for {pair}")
+    d = list(result.values())[0]
+    price = float(d["c"][0])
+    open_p = float(d["o"])
+    change_24h = round((price - open_p) / open_p * 100, 2) if open_p else 0
+    return {"price": price, "change_24h": change_24h, "volume": float(d["v"][1])}
+
+
+def fetch_kraken_klines(pair, interval=240, limit=50):
+    r = requests.get(
+        f"{KRAKEN}/OHLC",
+        params={"pair": pair, "interval": interval},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    result = r.json().get("result", {})
+    candles = [v for k, v in result.items() if k != "last"]
+    if not candles:
+        raise Exception(f"No candles for {pair}")
+    return [float(c[4]) for c in candles[0][-limit:]]
 
 
 def fetch_fear_greed():
@@ -260,78 +126,33 @@ def fetch_fear_greed():
     return {"value": int(d["value"]), "label": d["value_classification"]}
 
 
-def fetch_tv_signal(tv_symbol):
-    """
-    Pulls TradingView technical analysis summary via tradingview-screener public API.
-    Returns buy/sell/neutral counts and recommendation string.
-    """
+def fetch_tv_signal(pair):
     try:
-        payload = {
-            "symbols": {"tickers": [tv_symbol]},
-            "columns": [
-                "Recommend.All",
-                "Recommend.MA",
-                "Recommend.Other",
-            ],
-        }
         r = requests.post(
             "https://scanner.tradingview.com/crypto/scan",
-            json=payload,
-            timeout=10,
+            json={"symbols": {"tickers": [f"KRAKEN:{pair}"]}, "columns": ["Recommend.All"]},
             headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
         )
         if r.status_code == 200:
             data = r.json().get("data", [])
             if data:
-                vals = data[0].get("d", [None, None, None])
-                rec = vals[0]
-                if rec is None:
-                    return {"tv_rec": "N/A", "tv_score": 0}
-                score = round(rec, 2)
-                if score >= 0.5:
-                    label = "Strong buy"
-                elif score >= 0.1:
-                    label = "Buy"
-                elif score <= -0.5:
-                    label = "Strong sell"
-                elif score <= -0.1:
-                    label = "Sell"
-                else:
-                    label = "Neutral"
-                return {"tv_rec": label, "tv_score": score}
+                score = data[0].get("d", [None])[0]
+                if score is not None:
+                    if score >= 0.5:    label = "Strong buy"
+                    elif score >= 0.1:  label = "Buy"
+                    elif score <= -0.5: label = "Strong sell"
+                    elif score <= -0.1: label = "Sell"
+                    else:               label = "Neutral"
+                    return {"tv_rec": label, "tv_score": round(score, 2)}
     except Exception:
         pass
     return {"tv_rec": "N/A", "tv_score": 0}
 
 
-def fetch_tv_ideas(symbol_name):
-    """
-    Fetches community ideas from TradingView for a symbol.
-    Uses the tradingview-scraper compatible public endpoint.
-    """
-    try:
-        url = f"https://www.tradingview.com/symbols/{symbol_name}USD/ideas/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        api_url = f"https://www.tradingview.com/ideas/page-1/?symbol={symbol_name}USD&sort=popularity&type=1"
-        r = requests.get(api_url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            ideas = r.json() if r.headers.get("content-type", "").startswith("application/json") else []
-            if isinstance(ideas, list) and ideas:
-                bull = sum(1 for i in ideas[:20] if i.get("agree_count", 0) > i.get("disagree_count", 0))
-                bear = len(ideas[:20]) - bull
-                return {"bull": bull, "bear": bear, "total": len(ideas[:20])}
-    except Exception:
-        pass
-    return {"bull": 0, "bear": 0, "total": 0}
-
-
 def ask_claude(market_summary):
     if not ANTHROPIC_API_KEY:
-        return "Nastavte ANTHROPIC_API_KEY pro AI analýzu."
+        return "Nastavte ANTHROPIC_API_KEY pro AI analyzu."
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -341,97 +162,227 @@ def ask_claude(market_summary):
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-5",
                 "max_tokens": 600,
                 "system": (
-                    "Jsi krypto analytik. Píšeš stručně v češtině. "
-                    "Na základě dat dej jasný přehled trhu (2-3 věty), "
-                    "pak 2-3 konkrétní tipy s LONG/SHORT signálem a důvodem (1 věta každý). "
-                    "Žádné obecné výhrady, jen konkrétní analýza."
+                    "Jsi krypto analytik. Pises strucne v cestine. "
+                    "Dej jasny prehled trhu (2-3 vety), pak 2-3 konkretni tipy "
+                    "s LONG/SHORT signalem a duvodem. Zadne obecne vyhrady."
                 ),
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": f"Aktuální tržní data:\n{market_summary}\n\nZhodnoť trh a dej konkrétní doporučení.",
-                    }
-                ],
+                "messages": [{"role": "user", "content": f"Data:\n{market_summary}\n\nZhodnot trh."}],
             },
             timeout=30,
         )
         r.raise_for_status()
         return r.json()["content"][0]["text"]
     except Exception as e:
-        return f"Chyba při volání Claude API: {e}"
+        return f"Chyba Claude API: {e}"
 
 
-def refresh_data():
-    if cache["updating"]:
+def refresh_crypto():
+    if crypto_cache["updating"]:
         return
-    cache["updating"] = True
-    cache["error"] = None
+    crypto_cache["updating"] = True
+    crypto_cache["error"] = None
     try:
-        market = fetch_market_data()
         fg = fetch_fear_greed()
-
         coins_out = []
         summary_lines = []
-
         for coin in COINS:
-            cid = coin["id"]
-            sym = coin["sym"]
-            if cid not in market:
+            sym, pair = coin["sym"], coin["pair"]
+            try:
+                ticker = fetch_kraken_ticker(pair)
+                closes = fetch_kraken_klines(pair, interval=240, limit=50)
+            except Exception:
                 continue
-            m = market[cid]
-            spark = (m.get("sparkline_in_7d") or {}).get("price", [])
-            prices = spark[-30:] if len(spark) >= 15 else spark
-
-            rsi = calc_rsi(prices) if len(prices) >= 15 else 50.0
-            macd = calc_macd(prices) if len(prices) >= 26 else 0.0
-            chg = round(m.get("price_change_percentage_24h") or 0, 2)
-            price = m.get("current_price", 0)
-            volume = m.get("total_volume", 0)
-
-            tv = fetch_tv_signal(coin["tv"])
+            rsi = calc_rsi(closes) if len(closes) >= 15 else 50.0
+            macd = calc_macd(closes) if len(closes) >= 26 else 0.0
+            price, chg = ticker["price"], ticker["change_24h"]
+            tv = fetch_tv_signal(pair)
             signal = signal_from_indicators(rsi, macd, chg)
-
             coins_out.append({
-                "sym": sym,
-                "price": price,
-                "change_24h": chg,
-                "rsi": rsi,
-                "macd": round(macd, 4),
-                "signal": signal,
-                "tv_rec": tv["tv_rec"],
-                "tv_score": tv["tv_score"],
-                "volume": volume,
-                "market_cap": m.get("market_cap", 0),
+                "sym": sym, "price": price, "change_24h": chg,
+                "rsi": rsi, "macd": round(macd, 4), "signal": signal,
+                "tv_rec": tv["tv_rec"], "tv_score": tv["tv_score"],
+                "volume": ticker["volume"],
             })
-
             summary_lines.append(
-                f"{sym}: ${price:,.2f}, 24h={chg:+.1f}%, RSI={rsi}, "
-                f"MACD={'↑' if macd > 0 else '↓'}, TV={tv['tv_rec']}, signal={signal}"
+                f"{sym}: ${price:,.4f}, 24h={chg:+.1f}%, RSI={rsi}, "
+                f"MACD={'up' if macd > 0 else 'dn'}, TV={tv['tv_rec']}, signal={signal}"
             )
-
-            time.sleep(0.3)
-
-        market_summary = "\n".join(summary_lines)
-        market_summary += f"\nFear & Greed: {fg['value']} ({fg['label']})"
-
-        ai_analysis = ask_claude(market_summary)
-
-        cache["data"] = {
-            "coins": coins_out,
-            "fear_greed": fg,
-            "ai_analysis": ai_analysis,
-            "btc_dominance": None,
-        }
-        cache["updated_at"] = datetime.now(timezone.utc).isoformat()
-
+        summary = "\n".join(summary_lines) + f"\nFear & Greed: {fg['value']} ({fg['label']})"
+        crypto_cache["data"] = {"coins": coins_out, "fear_greed": fg, "ai_analysis": ask_claude(summary)}
+        crypto_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
-        cache["error"] = str(e)
+        crypto_cache["error"] = str(e)
     finally:
-        cache["updating"] = False
+        crypto_cache["updating"] = False
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# STOCKS FUNCTIONS
+# ════════════════════════════════════════════════════════════════════════════
+
+def fetch_patria_recommendations():
+    url = "https://www.patria.cz/akcie/vyzkum/doporuceni.html"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "cs-CZ,cs;q=0.9",
+        "Referer": "https://www.patria.cz/",
+    }
+    r = requests.get(url, headers=headers, timeout=25)
+    r.raise_for_status()
+    html = r.text
+
+    results_cz = []
+    results_monitor = []
+
+    # ── Czech recommendations ──
+    cz_section = re.search(
+        r'Patria\s*-\s*Investi[čc]n[ií]\s+doporu[čc]en[ií]\s*-\s*[Čč]R.*?(<table[^>]*>.*?</table>)',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    if cz_section:
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', cz_section.group(1), re.DOTALL)
+        for row in rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+            clean = [re.sub(r'<[^>]+>', '', c).strip().replace('\xa0', ' ') for c in cells]
+            if len(clean) >= 4 and clean[0] and clean[0] not in ('Název CP', '') and len(clean[0]) > 1:
+                results_cz.append({
+                    "name": clean[0],
+                    "rec": clean[1] if len(clean) > 1 else '',
+                    "rec_prev": clean[2] if len(clean) > 2 else '',
+                    "price": clean[3] if len(clean) > 3 else '',
+                    "target": clean[4] if len(clean) > 4 else '',
+                    "potential": clean[5] if len(clean) > 5 else '',
+                })
+
+    # ── Monitoring: find the table with Název CP | Společnost | Nové doporučení columns ──
+    # Split HTML into sections, find monitoring table specifically
+    # The monitoring table appears after "Monitoring investičních doporučení" heading
+    # and has a header row with "Název CP", "Společnost", "Nové doporučení"
+    tables = re.findall(r'<table[^>]*>(.*?)</table>', html, re.DOTALL)
+    for table in tables:
+        # Check if this table has the monitoring header
+        header_cells = re.findall(r'<th[^>]*>(.*?)</th>', table, re.DOTALL)
+        header_text = ' '.join(re.sub(r'<[^>]+>', '', h).strip() for h in header_cells)
+        if 'Spole' in header_text and 'doporu' in header_text.lower():
+            rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table, re.DOTALL)
+            for row in rows:
+                cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+                clean = [re.sub(r'<[^>]+>', '', c).strip().replace('\xa0', ' ') for c in cells]
+                # Valid monitoring row: at least 5 cells, name length > 3, not a header
+                if len(clean) >= 5 and len(clean[0]) > 3 and not clean[0].isdigit():
+                    name = clean[0]
+                    if name in ('Název CP', '') or len(name) < 2:
+                        continue
+                    analyst = clean[1] if len(clean) > 1 else ''
+                    rec_new = clean[2] if len(clean) > 2 else ''
+                    rec_prev = clean[3] if len(clean) > 3 else ''
+                    target = clean[4] if len(clean) > 4 else ''
+                    currency = clean[5] if len(clean) > 5 else ''
+                    if rec_new and len(rec_new) > 1:
+                        results_monitor.append({
+                            "name": name,
+                            "analyst": analyst,
+                            "rec": rec_new,
+                            "rec_prev": rec_prev,
+                            "target": f"{target} {currency}".strip() if target and target != '0,00' else '',
+                        })
+            break
+
+    return {
+        "cz": results_cz[:25],
+        "world_monitor": results_monitor[:25],
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def fetch_yahoo_recommendations(symbols):
+    results = []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    for sym in symbols:
+        try:
+            # Price + basic info
+            r1 = requests.get(
+                f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}",
+                params={"interval": "1d", "range": "2d"},
+                headers=headers, timeout=12,
+            )
+            if r1.status_code != 200:
+                continue
+            meta = r1.json().get("chart", {}).get("result", [{}])[0].get("meta", {})
+            price = meta.get("regularMarketPrice")
+            prev = meta.get("chartPreviousClose") or meta.get("regularMarketPreviousClose")
+            chg = round((price - prev) / prev * 100, 2) if price and prev else 0
+            name = meta.get("longName") or meta.get("shortName") or sym
+
+            # Analyst data
+            r2 = requests.get(
+                f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}",
+                params={"modules": "financialData"},
+                headers=headers, timeout=12,
+            )
+            rec_label, target, potential, analysts = "N/A", None, None, 0
+            if r2.status_code == 200:
+                fin = r2.json().get("quoteSummary", {}).get("result", [{}])[0].get("financialData", {})
+                rec_key = fin.get("recommendationKey", "")
+                target_r = fin.get("targetMeanPrice", {})
+                target = target_r.get("raw") if isinstance(target_r, dict) else None
+                ana_r = fin.get("numberOfAnalystOpinions", {})
+                analysts = ana_r.get("raw", 0) if isinstance(ana_r, dict) else 0
+                label_map = {
+                    "strong_buy": "Strong buy", "buy": "Buy", "hold": "Hold",
+                    "underperform": "Underperform", "sell": "Sell",
+                }
+                if rec_key:
+                    rec_label = label_map.get(rec_key, rec_key.replace("_", " ").title())
+                if target and price:
+                    potential = round((target - price) / price * 100, 1)
+
+            if price:
+                results.append({
+                    "sym": sym, "name": name,
+                    "price": round(price, 2),
+                    "change_24h": chg,
+                    "rec": rec_label,
+                    "target": round(target, 2) if target else None,
+                    "potential": potential,
+                    "analysts": analysts,
+                })
+            time.sleep(0.4)
+        except Exception:
+            continue
+
+    order = {"strong buy": 0, "buy": 1, "hold": 2, "underperform": 3, "sell": 4, "n/a": 5}
+    results.sort(key=lambda x: order.get(x.get("rec", "").lower(), 5))
+    return results
+
+
+def refresh_stocks():
+    try:
+        stocks_cache["patria"] = fetch_patria_recommendations()
+    except Exception as e:
+        stocks_cache["patria"] = {"error": str(e), "cz": [], "world_monitor": []}
+    stocks_cache["patria_at"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        stocks_cache["world"] = fetch_yahoo_recommendations(US_STOCKS)
+    except Exception:
+        stocks_cache["world"] = []
+    stocks_cache["world_at"] = datetime.now(timezone.utc).isoformat()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# HTML DASHBOARD
+# ════════════════════════════════════════════════════════════════════════════
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="cs">
@@ -440,249 +391,208 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Investiční dashboard</title>
 <style>
-:root{--bg:#f8f8f6;--card:#fff;--border:rgba(0,0,0,0.08);--text:#1a1a18;--muted:#6b6b68;--green-bg:#eaf3de;--green:#27500a;--red-bg:#fcebeb;--red:#791f1f;--amber-bg:#faeeda;--amber:#633806;--blue-bg:#e6f1fb;--blue:#0c447c}
-@media(prefers-color-scheme:dark){:root{--bg:#1a1a18;--card:#242422;--border:rgba(255,255,255,0.09);--text:#e8e6df;--muted:#9a9890;--green-bg:#173404;--green:#c0dd97;--red-bg:#501313;--red:#f09595;--amber-bg:#412402;--amber:#fac775;--blue-bg:#042c53;--blue:#b5d4f4}}
+:root{--bg:#f8f8f6;--card:#fff;--border:rgba(0,0,0,0.08);--text:#1a1a18;--muted:#6b6b68;--green-bg:#eaf3de;--green:#27500a;--red-bg:#fcebeb;--red:#791f1f;--amber-bg:#faeeda;--amber:#633806;--blue:#0c447c}
+@media(prefers-color-scheme:dark){:root{--bg:#1a1a18;--card:#242422;--border:rgba(255,255,255,0.09);--text:#e8e6df;--muted:#9a9890;--green-bg:#173404;--green:#c0dd97;--red-bg:#501313;--red:#f09595;--amber-bg:#412402;--amber:#fac775;--blue:#b5d4f4}}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);font-size:14px}
 .wrap{max-width:980px;margin:0 auto;padding:20px 16px 40px}
-.tabs{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0}
-.tab{padding:8px 18px;cursor:pointer;border-radius:8px 8px 0 0;font-size:13px;font-weight:500;color:var(--muted);border:0.5px solid transparent;border-bottom:none;background:transparent;transition:all .15s}
+h1{font-size:18px;font-weight:500;margin-bottom:16px}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:20px}
+.tab{padding:8px 18px;cursor:pointer;border-radius:8px 8px 0 0;font-size:13px;font-weight:500;color:var(--muted);border:0.5px solid transparent;border-bottom:none;background:transparent}
 .tab.active{background:var(--card);color:var(--text);border-color:var(--border);margin-bottom:-1px}
 .tab-content{display:none}.tab-content.active{display:block}
-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:8px}
-h1{font-size:18px;font-weight:500}
-.meta{font-size:12px;color:var(--muted)}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#639922;margin-right:5px}
-.dot.updating{background:#ef9f27;animation:pulse .8s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .top-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px}
 .metric{background:var(--card);border:0.5px solid var(--border);border-radius:10px;padding:12px 14px}
-.metric .label{font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
+.metric .lbl{font-size:11px;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
 .metric .val{font-size:22px;font-weight:500}
 .metric .sub{font-size:11px;color:var(--muted);margin-top:2px}
-.section-title{font-size:11px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
-.table-wrap{overflow-x:auto;margin-bottom:20px}
+.sec{font-size:11px;font-weight:500;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px;margin-top:18px}
+.tw{overflow-x:auto;margin-bottom:16px}
 table{width:100%;border-collapse:collapse;background:var(--card);border:0.5px solid var(--border);border-radius:10px;overflow:hidden}
-th{font-size:11px;color:var(--muted);font-weight:500;padding:10px 12px;text-align:left;border-bottom:0.5px solid var(--border)}
-td{padding:10px 12px;border-bottom:0.5px solid var(--border);vertical-align:middle}
+th{font-size:11px;color:var(--muted);font-weight:500;padding:9px 11px;text-align:left;border-bottom:0.5px solid var(--border)}
+td{padding:9px 11px;border-bottom:0.5px solid var(--border);vertical-align:middle;font-size:13px}
 tr:last-child td{border-bottom:none}
-tr:hover td{background:rgba(0,0,0,0.02)}
-.badge{display:inline-block;padding:3px 9px;border-radius:5px;font-size:11px;font-weight:500}
-.badge.LONG,.badge.buy,.badge.strong-buy,.badge.Koupit,.badge.Akumulovat{background:var(--green-bg);color:var(--green)}
-.badge.SHORT,.badge.sell,.badge.strong-sell,.badge.Prodat,.badge.Redukovat{background:var(--red-bg);color:var(--red)}
-.badge.NEUTRAL,.badge.hold,.badge.neutral,.badge.Držet{background:var(--amber-bg);color:var(--amber)}
-.badge.na{background:var(--border);color:var(--muted)}
-.rsi-bar{width:60px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-left:4px}
-.rsi-fill{height:100%;border-radius:3px}
-.fg-bar-wrap{height:6px;background:var(--border);border-radius:3px;flex:1;overflow:hidden}
-.fg-bar{height:100%;border-radius:3px}
-.ai-box{background:var(--card);border:0.5px solid var(--border);border-radius:10px;padding:16px;line-height:1.65;white-space:pre-wrap}
-.refresh-btn{font-size:12px;padding:6px 12px;border:0.5px solid var(--border);border-radius:7px;background:transparent;color:var(--text);cursor:pointer}
-.refresh-btn:hover{background:var(--border)}
-.error-box{background:var(--red-bg);color:var(--red);border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px}
-.spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--border);border-top-color:var(--muted);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+.badge{display:inline-block;padding:3px 8px;border-radius:5px;font-size:11px;font-weight:500}
+.g{background:var(--green-bg);color:var(--green)}.r{background:var(--red-bg);color:var(--red)}.a{background:var(--amber-bg);color:var(--amber)}.n{opacity:.5}
+.up{color:var(--green)}.dn{color:var(--red)}
+.fg-w{height:6px;background:var(--border);border-radius:3px;flex:1;overflow:hidden}
+.fg-f{height:100%;border-radius:3px}
+.rbar{width:55px;height:5px;background:var(--border);border-radius:3px;display:inline-block;vertical-align:middle;margin-left:4px}
+.rfill{height:100%;border-radius:3px}
+.ai-box{background:var(--card);border:0.5px solid var(--border);border-radius:10px;padding:16px;line-height:1.65;white-space:pre-wrap;font-size:13px}
+.btn{font-size:12px;padding:6px 12px;border:0.5px solid var(--border);border-radius:7px;background:transparent;color:var(--text);cursor:pointer}
+.btn:hover{background:var(--border)}
+.err{background:var(--red-bg);color:var(--red);border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px}
+.info{font-size:11px;color:var(--muted);padding:8px 12px;background:var(--card);border:0.5px solid var(--border);border-radius:8px;line-height:1.5;margin-bottom:12px}
+.note{font-size:11px;color:var(--muted);margin-top:10px}
+.sp{display:inline-block;width:11px;height:11px;border:2px solid var(--border);border-top-color:var(--muted);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:5px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.chg.up{color:var(--green)}.chg.down{color:var(--red)}
-.potential.pos{color:var(--green)}.potential.neg{color:var(--red)}
-.info-note{font-size:11px;color:var(--muted);margin-bottom:10px;padding:8px 12px;background:var(--card);border:0.5px solid var(--border);border-radius:8px;line-height:1.5}
-@media(max-width:600px){.hide-mobile{display:none}td,th{padding:8px 8px}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#639922;margin-right:5px}
+.dot.upd{background:#ef9f27;animation:pulse .8s infinite}
+.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
+.hdr-l{display:flex;align-items:center;gap:6px;font-weight:500;font-size:14px}
+.sm{font-size:12px;color:var(--muted);font-weight:400}
+@media(max-width:600px){.hm{display:none}td,th{padding:7px 7px}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <div><h1>Investiční dashboard</h1><div class="meta" id="meta-global">—</div></div>
-  </header>
-
+  <h1>Investiční dashboard</h1>
   <div class="tabs">
-    <button class="tab active" onclick="switchTab('crypto',this)">Krypto</button>
-    <button class="tab" onclick="switchTab('stocks-cz',this)">Akcie CZ (Patria)</button>
-    <button class="tab" onclick="switchTab('stocks-us',this)">Akcie US (Yahoo)</button>
+    <button class="tab active" onclick="sw('crypto',this)">Krypto</button>
+    <button class="tab" onclick="sw('cz',this)">Akcie CZ (Patria)</button>
+    <button class="tab" onclick="sw('us',this)">Akcie US (Yahoo)</button>
   </div>
 
-  <!-- ── TAB 1: CRYPTO ── -->
+  <!-- CRYPTO -->
   <div id="tab-crypto" class="tab-content active">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
-      <div><span class="dot" id="dot"></span><span style="font-weight:500">Crypto signály</span> <span class="meta" id="crypto-meta"></span></div>
-      <button class="refresh-btn" onclick="loadCrypto()">Obnovit ↻</button>
+    <div class="hdr">
+      <div class="hdr-l"><span class="dot" id="dot"></span>Crypto signály <span class="sm" id="crypto-meta"></span></div>
+      <button class="btn" onclick="loadCrypto()">Obnovit ↻</button>
     </div>
-    <div id="crypto-error"></div>
+    <div id="cerr"></div>
     <div class="top-grid">
-      <div class="metric"><div class="label">BTC</div><div class="val" id="btc-price">—</div><div class="sub" id="btc-chg"></div></div>
-      <div class="metric"><div class="label">ETH</div><div class="val" id="eth-price">—</div><div class="sub" id="eth-chg"></div></div>
+      <div class="metric"><div class="lbl">BTC</div><div class="val" id="btc-p">—</div><div class="sub" id="btc-c"></div></div>
+      <div class="metric"><div class="lbl">ETH</div><div class="val" id="eth-p">—</div><div class="sub" id="eth-c"></div></div>
       <div class="metric">
-        <div class="label">Fear &amp; Greed</div>
+        <div class="lbl">Fear &amp; Greed</div>
         <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
-          <span class="val" id="fg-val">—</span>
-          <span class="fg-bar-wrap"><span class="fg-bar" id="fg-bar" style="width:0%"></span></span>
+          <span class="val" id="fg-v">—</span>
+          <span class="fg-w"><span class="fg-f" id="fg-b" style="width:0%"></span></span>
         </div>
-        <div class="sub" id="fg-label"></div>
+        <div class="sub" id="fg-l"></div>
       </div>
-      <div class="metric"><div class="label">Aktualizace</div><div class="val" style="font-size:14px" id="update-time">—</div><div class="sub" id="update-age"></div></div>
+      <div class="metric"><div class="lbl">Aktualizace</div><div class="val" style="font-size:14px" id="upd-t">—</div><div class="sub" id="upd-a"></div></div>
     </div>
-    <div class="section-title">Signály</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Coin</th><th>Cena</th><th>24h</th><th class="hide-mobile">RSI</th><th class="hide-mobile">TV signal</th><th>Náš signal</th></tr></thead>
-        <tbody id="coin-tbody"><tr><td colspan="6" style="text-align:center;padding:24px;color:var(--muted)"><span class="spinner"></span>Načítám...</td></tr></tbody>
-      </table>
-    </div>
-    <div class="section-title" style="margin-top:20px">AI analýza (Claude)</div>
-    <div class="ai-box" id="ai-box" style="color:var(--muted);font-style:italic"><span class="spinner"></span>Čekám na analýzu...</div>
-    <div style="margin-top:12px;font-size:11px;color:var(--muted)">Refresh každou hodinu. Toto není finanční poradenství.</div>
+    <div class="sec" style="margin-top:4px">Signály</div>
+    <div class="tw"><table>
+      <thead><tr><th>Coin</th><th>Cena</th><th>24h</th><th class="hm">RSI</th><th class="hm">TV signal</th><th>Signal</th></tr></thead>
+      <tbody id="coin-tb"><tr><td colspan="6" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
+    </table></div>
+    <div class="sec">AI analýza (Claude)</div>
+    <div class="ai-box" id="ai-box" style="color:var(--muted);font-style:italic"><span class="sp"></span>Čekám...</div>
+    <p class="note">Refresh každou hodinu · Kraken API · Toto není finanční poradenství.</p>
   </div>
 
-  <!-- ── TAB 2: STOCKS CZ ── -->
-  <div id="tab-stocks-cz" class="tab-content">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
-      <div><span style="font-weight:500">Doporučení analytiků — ČR</span> <span class="meta" id="patria-meta"></span></div>
-      <button class="refresh-btn" onclick="loadStocks(true)">Obnovit ↻</button>
+  <!-- CZ STOCKS -->
+  <div id="tab-cz" class="tab-content">
+    <div class="hdr">
+      <div class="hdr-l">Akcie CZ — Patria <span class="sm" id="patria-meta"></span></div>
+      <button class="btn" onclick="loadStocks(true)">Obnovit ↻</button>
     </div>
-    <div id="stocks-error"></div>
-    <div class="info-note">Data jsou stahována z <a href="https://www.patria.cz/akcie/vyzkum/doporuceni.html" target="_blank" style="color:var(--blue)">patria.cz/akcie/vyzkum/doporuceni.html</a> jednou denně. Zdroj: Patria Finance / KBC Securities.</div>
-    <div class="section-title">Patria Finance — české akcie</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Akcie</th><th>Doporučení</th><th class="hide-mobile">Předchozí</th><th>Cena</th><th>Cíl 12M</th><th>Potenciál</th></tr></thead>
-        <tbody id="patria-cz-tbody"><tr><td colspan="6" style="text-align:center;padding:24px;color:var(--muted)"><span class="spinner"></span>Načítám...</td></tr></tbody>
-      </table>
-    </div>
-    <div class="section-title" style="margin-top:16px">Monitoring — světová doporučení analytiků</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Akcie</th><th>Analytik</th><th>Doporučení</th><th>Cílová cena</th></tr></thead>
-        <tbody id="patria-world-tbody"><tr><td colspan="4" style="text-align:center;padding:24px;color:var(--muted)"><span class="spinner"></span>Načítám...</td></tr></tbody>
-      </table>
-    </div>
-    <div style="font-size:11px;color:var(--muted)">Toto není finanční poradenství. Data z Patria.cz.</div>
+    <div id="serr"></div>
+    <div class="info">Data ze <a href="https://www.patria.cz/akcie/vyzkum/doporuceni.html" target="_blank" style="color:var(--blue)">patria.cz/akcie/vyzkum/doporuceni.html</a> · Refresh 1× denně · Zdroj: Patria Finance / KBC Securities</div>
+    <div class="sec" style="margin-top:4px">Patria Finance — doporučení ČR</div>
+    <div class="tw"><table>
+      <thead><tr><th>Akcie</th><th>Doporučení</th><th class="hm">Předchozí</th><th>Cena</th><th>Cíl 12M</th><th>Potenciál</th></tr></thead>
+      <tbody id="cz-tb"><tr><td colspan="6" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
+    </table></div>
+    <div class="sec">Monitoring — doporučení globálních bank</div>
+    <div class="tw"><table>
+      <thead><tr><th>Akcie</th><th class="hm">Analytická firma</th><th>Doporučení</th><th class="hm">Předchozí</th><th>Cílová cena</th></tr></thead>
+      <tbody id="mon-tb"><tr><td colspan="5" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
+    </table></div>
+    <p class="note">Toto není finanční poradenství.</p>
   </div>
 
-  <!-- ── TAB 3: STOCKS US ── -->
-  <div id="tab-stocks-us" class="tab-content">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
-      <div><span style="font-weight:500">Konsenzus analytiků — US akcie</span> <span class="meta" id="yahoo-meta"></span></div>
-      <button class="refresh-btn" onclick="loadStocks(true)">Obnovit ↻</button>
+  <!-- US STOCKS -->
+  <div id="tab-us" class="tab-content">
+    <div class="hdr">
+      <div class="hdr-l">Akcie US — Yahoo Finance <span class="sm" id="yahoo-meta"></span></div>
+      <button class="btn" onclick="loadStocks(true)">Obnovit ↻</button>
     </div>
-    <div class="info-note">Data ze Yahoo Finance. Konsenzus ze všech sledujících analytiků. Skóre: 1 = Strong buy, 5 = Strong sell.</div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Ticker</th><th class="hide-mobile">Název</th><th>Cena</th><th>24h</th><th>Konsenzus</th><th class="hide-mobile">Cíl. cena</th><th>Potenciál</th></tr></thead>
-        <tbody id="yahoo-tbody"><tr><td colspan="7" style="text-align:center;padding:24px;color:var(--muted)"><span class="spinner"></span>Načítám...</td></tr></tbody>
-      </table>
-    </div>
-    <div style="font-size:11px;color:var(--muted)">Toto není finanční poradenství. Refresh 1x denně.</div>
+    <div class="info">Konsenzus analytiků · Yahoo Finance · Refresh 1× denně · Řazeno: nejsilnější doporučení nahoře</div>
+    <div class="tw"><table>
+      <thead><tr><th>Ticker</th><th class="hm">Název</th><th>Cena</th><th>24h</th><th>Konsenzus</th><th class="hm">Cíl. cena</th><th>Potenciál</th></tr></thead>
+      <tbody id="us-tb"><tr><td colspan="7" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
+    </table></div>
+    <p class="note">Toto není finanční poradenství.</p>
   </div>
 </div>
-
 <script>
-function fmt(n){if(!n&&n!==0)return'—';if(n>=1000)return'$'+n.toLocaleString('cs-CZ',{maximumFractionDigits:0});if(n>=1)return'$'+n.toFixed(2);return'$'+n.toFixed(4)}
-function fmtAge(iso){if(!iso)return'';const d=Math.round((Date.now()-new Date(iso))/60000);if(d<2)return'právě teď';if(d<60)return`před ${d} min`;if(d<1440)return`před ${Math.floor(d/60)} hod`;return`před ${Math.floor(d/1440)} dny`}
-function rsiColor(r){return r<30?'#e24b4a':r<45?'#639922':r>70?'#e24b4a':r>55?'#ef9f27':'#888780'}
-function badgeClass(r){if(!r||r==='N/A')return'na';const s=r.toLowerCase();if(s.includes('strong buy')||s.includes('koupit')||s.includes('akumulovat'))return'buy';if(s.includes('strong sell')||s.includes('prodat')||s.includes('redukovat'))return'sell';if(s.includes('buy'))return'buy';if(s.includes('sell'))return'sell';return'hold'}
-
-function switchTab(id, btn){
-  document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(el=>el.classList.remove('active'));
+function fp(n){if(!n&&n!==0)return'—';if(n>=1000)return'$'+n.toLocaleString('cs-CZ',{maximumFractionDigits:0});if(n>=1)return'$'+n.toFixed(2);return'$'+n.toFixed(4)}
+function fage(iso){if(!iso)return'';const d=Math.round((Date.now()-new Date(iso))/60000);if(d<2)return'právě teď';if(d<60)return`před ${d} min`;if(d<1440)return`před ${Math.floor(d/60)} hod`;return`před ${Math.floor(d/1440)} dny`}
+function rc(r){return r<30?'#e24b4a':r<45?'#639922':r>70?'#e24b4a':r>55?'#ef9f27':'#888780'}
+function bc(r){
+  if(!r||r==='N/A')return'n';
+  const s=r.toLowerCase();
+  if(s.includes('strong buy')||s==='koupit'||s==='akumulovat'||s.includes('buy'))return'g';
+  if(s.includes('strong sell')||s==='prodat'||s==='redukovat'||s.includes('sell'))return'r';
+  return'a';
+}
+function sw(id,btn){
+  document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(e=>e.classList.remove('active'));
   document.getElementById('tab-'+id).classList.add('active');
   btn.classList.add('active');
-  if(id==='stocks-cz'||id==='stocks-us') loadStocks();
+  if(id==='cz'||id==='us')loadStocks();
 }
-
-// ── Crypto ──────────────────────────────────────────────────────────────────
 async function loadCrypto(){
-  document.getElementById('dot').className='dot updating';
+  document.getElementById('dot').className='dot upd';
   try{
-    const r=await fetch('/api/data');
-    const d=await r.json();
-    if(d.error&&!d.coins){document.getElementById('crypto-error').innerHTML=`<div class="error-box">Chyba: ${d.error}</div>`;return}
-    document.getElementById('crypto-error').innerHTML='';
+    const d=await fetch('/api/data').then(r=>r.json());
+    if(d.error&&!d.coins){document.getElementById('cerr').innerHTML=`<div class="err">${d.error}</div>`;document.getElementById('dot').className='dot';return}
+    document.getElementById('cerr').innerHTML='';
     const btc=d.coins?.find(c=>c.sym==='BTC'),eth=d.coins?.find(c=>c.sym==='ETH');
-    if(btc){document.getElementById('btc-price').textContent=fmt(btc.price);const bc=btc.change_24h;document.getElementById('btc-chg').innerHTML=`<span class="chg ${bc>=0?'up':'down'}">${bc>=0?'+':''}${bc.toFixed(2)}%</span>`}
-    if(eth){document.getElementById('eth-price').textContent=fmt(eth.price);const ec=eth.change_24h;document.getElementById('eth-chg').innerHTML=`<span class="chg ${ec>=0?'up':'down'}">${ec>=0?'+':''}${ec.toFixed(2)}%</span>`}
+    if(btc){document.getElementById('btc-p').textContent=fp(btc.price);const b=btc.change_24h;document.getElementById('btc-c').innerHTML=`<span class="${b>=0?'up':'dn'}">${b>=0?'+':''}${b.toFixed(2)}%</span>`}
+    if(eth){document.getElementById('eth-p').textContent=fp(eth.price);const e=eth.change_24h;document.getElementById('eth-c').innerHTML=`<span class="${e>=0?'up':'dn'}">${e>=0?'+':''}${e.toFixed(2)}%</span>`}
     const fg=d.fear_greed||{};
-    document.getElementById('fg-val').textContent=fg.value||'—';
-    document.getElementById('fg-label').textContent=fg.label||'';
-    const bar=document.getElementById('fg-bar');
-    bar.style.width=(fg.value||0)+'%';
-    bar.style.background=fg.value<30?'#e24b4a':fg.value<50?'#ef9f27':fg.value<75?'#639922':'#3b6d11';
-    const ts=d.updated_at;
-    const dt=new Date(ts);
-    document.getElementById('update-time').textContent=dt.toLocaleTimeString('cs-CZ',{hour:'2-digit',minute:'2-digit'});
-    document.getElementById('update-age').textContent=fmtAge(ts);
-    document.getElementById('crypto-meta').textContent=fmtAge(ts);
+    document.getElementById('fg-v').textContent=fg.value||'—';
+    document.getElementById('fg-l').textContent=fg.label||'';
+    const b=document.getElementById('fg-b');b.style.width=(fg.value||0)+'%';
+    b.style.background=fg.value<30?'#e24b4a':fg.value<50?'#ef9f27':fg.value<75?'#639922':'#3b6d11';
+    const dt=new Date(d.updated_at);
+    document.getElementById('upd-t').textContent=dt.toLocaleTimeString('cs-CZ',{hour:'2-digit',minute:'2-digit'});
+    document.getElementById('upd-a').textContent=fage(d.updated_at);
+    document.getElementById('crypto-meta').textContent=fage(d.updated_at);
     let rows='';
     for(const c of d.coins||[]){
-      const cc=c.change_24h>=0?'up':'down',ct=(c.change_24h>=0?'+':'')+c.change_24h.toFixed(2)+'%';
+      const cc=c.change_24h>=0?'up':'dn',ct=(c.change_24h>=0?'+':'')+c.change_24h.toFixed(2)+'%';
       const rp=Math.min(Math.max(c.rsi,0),100);
-      const tvCls=badgeClass(c.tv_rec);
-      rows+=`<tr><td><strong>${c.sym}</strong></td><td>${fmt(c.price)}</td><td class="chg ${cc}">${ct}</td><td class="hide-mobile">${c.rsi}<span class="rsi-bar"><span class="rsi-fill" style="width:${rp}%;background:${rsiColor(c.rsi)}"></span></span></td><td class="hide-mobile"><span class="badge ${tvCls}">${c.tv_rec}</span></td><td><span class="badge ${c.signal}">${c.signal}</span></td></tr>`;
+      const sc=c.signal==='LONG'?'g':c.signal==='SHORT'?'r':'a';
+      rows+=`<tr><td><strong>${c.sym}</strong></td><td>${fp(c.price)}</td><td class="${cc}">${ct}</td><td class="hm">${c.rsi}<span class="rbar"><span class="rfill" style="width:${rp}%;background:${rc(c.rsi)}"></span></span></td><td class="hm"><span class="badge ${bc(c.tv_rec)}">${c.tv_rec}</span></td><td><span class="badge ${sc}">${c.signal}</span></td></tr>`;
     }
-    document.getElementById('coin-tbody').innerHTML=rows||'<tr><td colspan="6" style="text-align:center;color:var(--muted)">Žádná data</td></tr>';
-    const ai=document.getElementById('ai-box');
-    ai.style.fontStyle='normal';ai.style.color='var(--text)';
-    ai.textContent=d.ai_analysis||'—';
+    document.getElementById('coin-tb').innerHTML=rows||'<tr><td colspan="6" style="text-align:center;color:var(--muted)">Žádná data</td></tr>';
+    const ai=document.getElementById('ai-box');ai.style.fontStyle='normal';ai.textContent=d.ai_analysis||'—';
     document.getElementById('dot').className='dot';
-  }catch(e){document.getElementById('crypto-error').innerHTML=`<div class="error-box">Chyba: ${e.message}</div>`;document.getElementById('dot').className='dot'}
+  }catch(e){document.getElementById('cerr').innerHTML=`<div class="err">Chyba: ${e.message}</div>`;document.getElementById('dot').className='dot'}
 }
-
-// ── Stocks ───────────────────────────────────────────────────────────────────
-let stocksLoaded=false;
+let sDone=false;
 async function loadStocks(force){
-  if(stocksLoaded&&!force)return;
-  stocksLoaded=true;
+  if(sDone&&!force)return;sDone=true;
   try{
-    const r=await fetch('/api/stocks');
-    const d=await r.json();
-
-    // Patria CZ
-    document.getElementById('patria-meta').textContent=fmtAge(d.patria_at);
-    const czData=d.patria?.cz||[];
-    let czRows='';
-    if(d.patria?.error){czRows=`<tr><td colspan="6" style="color:var(--red);padding:12px">Chyba scrapingu: ${d.patria.error}</td></tr>`}
-    else if(czData.length){
-      for(const s of czData){
-        const bc=badgeClass(s.rec);
-        const pot=s.potential?`<span class="potential ${parseFloat(s.potential)>=0?'pos':'neg'}">${s.potential}%</span>`:'—';
-        czRows+=`<tr><td><strong>${s.name}</strong></td><td><span class="badge ${bc}">${s.rec||'—'}</span></td><td class="hide-mobile" style="color:var(--muted);font-size:12px">${s.rec_prev||'—'}</td><td>${s.price||'—'}</td><td>${s.target||'—'}</td><td>${pot}</td></tr>`;
-      }
-    }else{czRows='<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--muted)">Žádná data z Patrie (stránka může být chráněná)</td></tr>'}
-    document.getElementById('patria-cz-tbody').innerHTML=czRows;
-
-    // Patria world monitor
-    const wData=d.patria?.world_monitor||[];
-    let wRows='';
-    if(wData.length){
-      for(const s of wData){
-        const bc=badgeClass(s.rec);
-        wRows+=`<tr><td><strong>${s.name}</strong></td><td style="color:var(--muted);font-size:12px">${s.analyst||'—'}</td><td><span class="badge ${bc}">${s.rec||'—'}</span></td><td>${s.target||'—'}</td></tr>`;
-      }
-    }else{wRows='<tr><td colspan="4" style="text-align:center;padding:20px;color:var(--muted)">Žádná data</td></tr>'}
-    document.getElementById('patria-world-tbody').innerHTML=wRows;
-
-    // Yahoo US
-    document.getElementById('yahoo-meta').textContent=fmtAge(d.world_at);
-    const usData=d.world||[];
-    let usRows='';
-    if(usData.length){
-      for(const s of usData){
-        const cc=s.change_24h>=0?'up':'down',ct=(s.change_24h>=0?'+':'')+s.change_24h.toFixed(2)+'%';
-        const bc=badgeClass(s.rec);
-        const pot=s.potential!=null?`<span class="potential ${s.potential>=0?'pos':'neg'}">${s.potential>0?'+':''}${s.potential}%</span>`:'—';
-        usRows+=`<tr><td><strong>${s.sym}</strong></td><td class="hide-mobile" style="font-size:12px;color:var(--muted)">${s.name||''}</td><td>${fmt(s.price)}</td><td class="chg ${cc}">${ct}</td><td><span class="badge ${bc}">${s.rec}</span></td><td class="hide-mobile">${s.target?fmt(s.target):'—'}</td><td>${pot}</td></tr>`;
-      }
-    }else{usRows='<tr><td colspan="7" style="text-align:center;padding:20px;color:var(--muted)">Načítám Yahoo Finance...</td></tr>'}
-    document.getElementById('yahoo-tbody').innerHTML=usRows;
-
-  }catch(e){
-    document.getElementById('stocks-error').innerHTML=`<div class="error-box">Chyba: ${e.message}</div>`;
-  }
+    const d=await fetch('/api/stocks').then(r=>r.json());
+    document.getElementById('patria-meta').textContent=fage(d.patria_at);
+    document.getElementById('yahoo-meta').textContent=fage(d.world_at);
+    const cz=d.patria?.cz||[];
+    let czR='';
+    if(d.patria?.error)czR=`<tr><td colspan="6" style="color:var(--muted);padding:12px;font-size:12px">${d.patria.error}</td></tr>`;
+    else if(cz.length){for(const s of cz){const pot=s.potential?`<span class="${parseFloat(s.potential)>=0?'up':'dn'}">${s.potential}%</span>`:'—';czR+=`<tr><td><strong>${s.name}</strong></td><td><span class="badge ${bc(s.rec)}">${s.rec||'—'}</span></td><td class="hm" style="color:var(--muted)">${s.rec_prev||'—'}</td><td>${s.price||'—'}</td><td>${s.target||'—'}</td><td>${pot}</td></tr>`;}}
+    else czR='<tr><td colspan="6" style="text-align:center;padding:20px;color:var(--muted)">Data z Patrie se nepodařilo načíst</td></tr>';
+    document.getElementById('cz-tb').innerHTML=czR;
+    const mon=d.patria?.world_monitor||[];
+    let monR='';
+    if(mon.length){for(const s of mon)monR+=`<tr><td><strong>${s.name}</strong></td><td class="hm" style="color:var(--muted);font-size:12px">${s.analyst||'—'}</td><td><span class="badge ${bc(s.rec)}">${s.rec||'—'}</span></td><td class="hm" style="color:var(--muted);font-size:12px">${s.rec_prev||'—'}</td><td>${s.target||'—'}</td></tr>`;}
+    else monR='<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--muted)">Žádná data</td></tr>';
+    document.getElementById('mon-tb').innerHTML=monR;
+    const us=d.world||[];
+    let usR='';
+    if(us.length){for(const s of us){const cc=s.change_24h>=0?'up':'dn',ct=(s.change_24h>=0?'+':'')+s.change_24h.toFixed(2)+'%';const pot=s.potential!=null?`<span class="${s.potential>=0?'up':'dn'}">${s.potential>0?'+':''}${s.potential}%</span>`:'—';usR+=`<tr><td><strong>${s.sym}</strong></td><td class="hm" style="font-size:12px;color:var(--muted)">${s.name||''}</td><td>${fp(s.price)}</td><td class="${cc}">${ct}</td><td><span class="badge ${bc(s.rec)}">${s.rec}</span></td><td class="hm">${s.target?fp(s.target):'—'}</td><td>${pot}</td></tr>`;}}
+    else usR='<tr><td colspan="7" style="text-align:center;padding:20px;color:var(--muted)">Načítám Yahoo Finance (může trvat 1–2 min)...</td></tr>';
+    document.getElementById('us-tb').innerHTML=usR;
+  }catch(e){document.getElementById('serr').innerHTML=`<div class="err">Chyba: ${e.message}</div>`;}
 }
-
 loadCrypto();
-setInterval(loadCrypto, 60*60*1000);
+setInterval(loadCrypto,60*60*1000);
 </script>
 </body>
 </html>"""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ════════════════════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
@@ -691,34 +601,26 @@ def index():
 
 @app.route("/api/data")
 def api_data():
-    if cache["data"] is None and not cache["updating"]:
-        refresh_data()
-    if cache["error"] and cache["data"] is None:
-        return jsonify({"error": cache["error"]})
+    if crypto_cache["data"] is None and not crypto_cache["updating"]:
+        refresh_crypto()
+    if crypto_cache["error"] and crypto_cache["data"] is None:
+        return jsonify({"error": crypto_cache["error"]})
     return jsonify({
-        **(cache["data"] or {}),
-        "updated_at": cache["updated_at"],
-        "updating": cache["updating"],
-        "error": cache["error"],
+        **(crypto_cache["data"] or {}),
+        "updated_at": crypto_cache["updated_at"],
+        "updating": crypto_cache["updating"],
+        "error": crypto_cache["error"],
     })
-
-
-@app.route("/api/refresh", methods=["POST"])
-def api_refresh():
-    refresh_data()
-    return jsonify({"ok": True})
 
 
 @app.route("/api/stocks")
 def api_stocks():
-    # Refresh if never loaded or older than 24h
-    from datetime import timedelta
     pat_at = stocks_cache.get("patria_at")
-    needs_refresh = (
+    needs = (
         stocks_cache["patria"] is None or
         (pat_at and (datetime.now(timezone.utc) - datetime.fromisoformat(pat_at)) > timedelta(hours=23))
     )
-    if needs_refresh:
+    if needs:
         refresh_stocks()
     return jsonify({
         "patria": stocks_cache.get("patria") or {},
@@ -726,6 +628,13 @@ def api_stocks():
         "patria_at": stocks_cache.get("patria_at"),
         "world_at": stocks_cache.get("world_at"),
     })
+
+
+@app.route("/api/refresh", methods=["POST"])
+def api_refresh():
+    refresh_crypto()
+    return jsonify({"ok": True})
+
 
 @app.route("/api/stocks/refresh", methods=["POST"])
 def api_stocks_refresh():
