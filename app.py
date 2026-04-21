@@ -35,6 +35,7 @@ US_STOCKS = [
 # ── Caches ───────────────────────────────────────────────────────────────────
 crypto_cache = {"data": None, "updated_at": None, "updating": False, "error": None}
 stocks_cache = {"patria": None, "world": None, "patria_at": None, "world_at": None}
+portfolio_cache = {"data": None, "updated_at": None, "error": None}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -424,6 +425,230 @@ def refresh_stocks():
 # HTML DASHBOARD
 # ════════════════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════════════════
+# TRADING 212 PORTFOLIO FUNCTIONS
+# ════════════════════════════════════════════════════════════════════════════
+
+T212_KEY = os.environ.get("T212_API_KEY", "")
+T212_BASE = "https://live.trading212.com/api/v0"
+
+def t212_get(path):
+    """Make authenticated GET request to Trading 212 API."""
+    if not T212_KEY:
+        raise Exception("Chybí T212_API_KEY v environment variables")
+    r = requests.get(
+        f"{T212_BASE}{path}",
+        headers={"Authorization": T212_KEY},
+        timeout=15,
+    )
+    if r.status_code == 401:
+        raise Exception("Neplatný T212 API klíč")
+    if r.status_code == 429:
+        raise Exception("Trading 212 rate limit — zkus za chvíli")
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_t212_portfolio():
+    """Fetch all positions + pies from Trading 212."""
+    # Account cash & totals
+    cash_data = t212_get("/equity/account/cash")
+    
+    # All open positions
+    positions_raw = t212_get("/equity/portfolio")
+    positions = positions_raw if isinstance(positions_raw, list) else positions_raw.get("items", [])
+
+    # All pies
+    pies_raw = t212_get("/equity/pies")
+    pies = pies_raw if isinstance(pies_raw, list) else pies_raw.get("items", [])
+    
+    # Enrich each pie with its detail (slices)
+    pies_detail = []
+    for pie in pies[:10]:  # limit to 10 pies
+        try:
+            pie_id = pie.get("id")
+            detail = t212_get(f"/equity/pies/{pie_id}")
+            pies_detail.append(detail)
+        except Exception:
+            pies_detail.append(pie)
+
+    return {
+        "cash": cash_data,
+        "positions": positions,
+        "pies": pies_detail,
+    }
+
+
+def enrich_with_finnhub(positions):
+    """Add current price, analyst rec and target from Finnhub for each position."""
+    api_key = os.environ.get("FINNHUB_API_KEY", "")
+    enriched = []
+    for pos in positions:
+        ticker_raw = pos.get("ticker", "")
+        # T212 tickers look like "AAPL_US_EQ" → extract base symbol
+        sym = ticker_raw.split("_")[0] if "_" in ticker_raw else ticker_raw
+        
+        rec_label, target, analysts = "N/A", None, 0
+        current_price = pos.get("currentPrice") or pos.get("currentPriceInAccountCurrency")
+        
+        if api_key and sym:
+            try:
+                # Recommendation trends
+                rr = requests.get(
+                    "https://finnhub.io/api/v1/stock/recommendation",
+                    params={"symbol": sym, "token": api_key},
+                    timeout=8,
+                )
+                if rr.status_code == 200:
+                    trends = rr.json()
+                    if trends:
+                        t = trends[0]
+                        sb, b, h, s, ss = (t.get("strongBuy",0), t.get("buy",0),
+                                           t.get("hold",0), t.get("sell",0), t.get("strongSell",0))
+                        analysts = sb + b + h + s + ss
+                        if analysts > 0:
+                            score = (sb*1 + b*2 + h*3 + s*4 + ss*5) / analysts
+                            if score <= 1.5:    rec_label = "Strong buy"
+                            elif score <= 2.5:  rec_label = "Buy"
+                            elif score <= 3.5:  rec_label = "Hold"
+                            elif score <= 4.5:  rec_label = "Sell"
+                            else:               rec_label = "Strong sell"
+                # Price target
+                rt = requests.get(
+                    "https://finnhub.io/api/v1/stock/price-target",
+                    params={"symbol": sym, "token": api_key},
+                    timeout=8,
+                )
+                if rt.status_code == 200:
+                    pt = rt.json()
+                    target = pt.get("targetMean")
+                time.sleep(0.15)
+            except Exception:
+                pass
+
+        avg_price = pos.get("averagePrice") or pos.get("averagePricePaid", 0)
+        quantity = pos.get("quantity", 0)
+        current = current_price or avg_price
+        invested = avg_price * quantity if avg_price and quantity else 0
+        current_val = current * quantity if current and quantity else invested
+        pnl = current_val - invested if invested else 0
+        pnl_pct = round(pnl / invested * 100, 2) if invested else 0
+        potential = round((target - current) / current * 100, 1) if target and current else None
+
+        enriched.append({
+            "ticker": ticker_raw,
+            "sym": sym,
+            "name": pos.get("fullName") or pos.get("name") or sym,
+            "quantity": round(quantity, 4) if quantity else 0,
+            "avg_price": round(avg_price, 4) if avg_price else 0,
+            "current_price": round(current, 4) if current else 0,
+            "invested": round(invested, 2),
+            "current_val": round(current_val, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": pnl_pct,
+            "rec": rec_label,
+            "target": round(target, 2) if target else None,
+            "potential": potential,
+            "analysts": analysts,
+            "in_pie": (pos.get("pieQuantity") or pos.get("quantityInPies") or 0) > 0,
+        })
+    return enriched
+
+
+def ask_claude_portfolio(positions_summary, cash_info):
+    """Ask Claude to analyze the portfolio and give buy/hold/sell per position."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    if not positions_summary:
+        return None
+    
+    lines = []
+    for p in positions_summary:
+        pnl_str = f"{p['pnl_pct']:+.1f}%"
+        rec_str = f"analytici: {p['rec']}" if p['rec'] != 'N/A' else "analytici: bez dat"
+        target_str = f", cíl: ${p['target']}" if p['target'] else ""
+        lines.append(
+            f"{p['sym']}: držíš {p['quantity']} ks, nákup ${p['avg_price']}, "
+            f"nyní ${p['current_price']} ({pnl_str}), {rec_str}{target_str}"
+        )
+    
+    cash = cash_info.get("free") or cash_info.get("cash") or 0
+    total = cash_info.get("total") or cash_info.get("totalCash") or 0
+    
+    cash_str = f"{cash:.0f}"
+    portfolio_lines = "\n".join(lines)
+    prompt = (
+        f"Moje portfolio (volna hotovost: ${cash_str}):\n" +
+        portfolio_lines +
+        "\n\nPro kazdou pozici dej doporuceni KOUPIT / DRZET / PRODAT. "
+        "Format: [TICKER]: [DOPORUCENI] - [3-4 vety: duvod, rizika, co sledovat]. "
+        "Na konci 2-3 vety o celkovem portfoliu. Pis cesky, strucne, konkretne."
+    )
+    
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1500,
+                "system": "Jsi osobní investiční analytik. Analyzuješ reálné portfolio a dáváš konkrétní, stručná doporučení. Nepoužívej obecné fráze. Vždy uveď jasné KOUPIT/DRŽET/PRODAT.",
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=45,
+        )
+        r.raise_for_status()
+        return r.json()["content"][0]["text"]
+    except Exception as e:
+        return f"Chyba Claude API: {e}"
+
+
+def refresh_portfolio():
+    """Main function to refresh T212 portfolio data."""
+    portfolio_cache["error"] = None
+    try:
+        raw = fetch_t212_portfolio()
+        positions = raw["positions"]
+        cash = raw["cash"]
+        pies = raw["pies"]
+        
+        # Enrich positions with Finnhub data (limit to 20 to stay in rate limits)
+        enriched = enrich_with_finnhub(positions[:20])
+        
+        # Get Claude analysis
+        ai = ask_claude_portfolio(enriched, cash)
+        
+        # Process pies summary
+        pies_summary = []
+        for pie in pies:
+            settings = pie.get("settings") or pie.get("instrument") or {}
+            result = pie.get("result") or {}
+            instruments = pie.get("instruments") or []
+            pies_summary.append({
+                "id": pie.get("id"),
+                "name": settings.get("name") or pie.get("name") or f"Koláč {pie.get('id','')}",
+                "value": round(result.get("value") or pie.get("currentValue") or 0, 2),
+                "invested": round(result.get("investedValue") or pie.get("investedValue") or 0, 2),
+                "pnl_pct": round(result.get("returnPercentage") or 0, 2),
+                "slices": len(instruments),
+            })
+        
+        portfolio_cache["data"] = {
+            "positions": enriched,
+            "pies": pies_summary,
+            "cash": cash,
+            "ai_analysis": ai,
+        }
+        portfolio_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        portfolio_cache["error"] = str(e)
+
+
+
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="cs">
 <head>
@@ -483,6 +708,7 @@ tr:last-child td{border-bottom:none}
     <button class="tab active" onclick="sw('crypto',this)">Krypto</button>
     <button class="tab" onclick="sw('cz',this)">Akcie CZ (Patria)</button>
     <button class="tab" onclick="sw('us',this)">Akcie US (Yahoo)</button>
+    <button class="tab" onclick="sw('portfolio',this)">Moje portfolio (T212)</button>
   </div>
 
   <!-- CRYPTO -->
@@ -549,6 +775,42 @@ tr:last-child td{border-bottom:none}
     </table></div>
     <p class="note">Toto není finanční poradenství.</p>
   </div>
+
+  <!-- PORTFOLIO TAB -->
+  <div id="tab-portfolio" class="tab-content">
+    <div class="hdr">
+      <div class="hdr-l">Moje portfolio — Trading 212 <span class="sm" id="t212-meta"></span></div>
+      <button class="btn" onclick="loadPortfolio(true)">Obnovit ↻</button>
+    </div>
+    <div id="perr"></div>
+    <div id="p-no-key" style="display:none" class="info">
+      Přidej <strong>T212_API_KEY</strong> do Render → Environment. API klíč vygeneruješ v Trading 212 → Profil → API (beta).
+    </div>
+    <div id="p-content" style="display:none">
+      <div class="top-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:16px">
+        <div class="metric"><div class="lbl">Celková hodnota</div><div class="val" id="p-total">—</div></div>
+        <div class="metric"><div class="lbl">Investováno</div><div class="val" id="p-invested">—</div></div>
+        <div class="metric"><div class="lbl">P&amp;L</div><div class="val" id="p-pnl">—</div></div>
+        <div class="metric"><div class="lbl">Volná hotovost</div><div class="val" id="p-cash">—</div></div>
+      </div>
+      <div id="pies-section" style="display:none">
+        <div class="sec" style="margin-top:4px">Koláče (Pies)</div>
+        <div class="tw"><table>
+          <thead><tr><th>Název</th><th>Hodnota</th><th>Investováno</th><th>P&amp;L</th><th>Počet titulů</th></tr></thead>
+          <tbody id="pies-tb"></tbody>
+        </table></div>
+      </div>
+      <div class="sec" style="margin-top:4px">Pozice</div>
+      <div class="tw"><table>
+        <thead><tr><th>Ticker</th><th class="hm">Ks</th><th>Nákup</th><th>Nyní</th><th>P&amp;L</th><th class="hm">Konsenzus</th><th class="hm">Cíl</th><th class="hm">Potenciál</th></tr></thead>
+        <tbody id="pos-tb"><tr><td colspan="8" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
+      </table></div>
+      <div class="sec" style="margin-top:16px">AI analýza portfolia (Claude)</div>
+      <div class="ai-box" id="p-ai" style="color:var(--muted);font-style:italic"><span class="sp"></span>Připravuji analýzu...</div>
+    </div>
+    <p class="note" style="margin-top:12px">Data z Trading 212 API · Toto není finanční poradenství.</p>
+  </div>
+
 </div>
 <script>
 function fp(n){if(!n&&n!==0)return'—';if(n>=1000)return'$'+n.toLocaleString('cs-CZ',{maximumFractionDigits:0});if(n>=1)return'$'+n.toFixed(2);return'$'+n.toFixed(4)}
@@ -567,6 +829,7 @@ function sw(id,btn){
   document.getElementById('tab-'+id).classList.add('active');
   btn.classList.add('active');
   if(id==='cz'||id==='us')loadStocks();
+  if(id==='portfolio')loadPortfolio();
 }
 async function loadCrypto(){
   document.getElementById('dot').className='dot upd';
@@ -625,6 +888,90 @@ async function loadStocks(force){
 }
 loadCrypto();
 setInterval(loadCrypto,60*60*1000);
+
+// ── Portfolio ────────────────────────────────────────────────────────────────
+function fmtVal(n){if(!n&&n!==0)return'—';if(Math.abs(n)>=1000)return n.toLocaleString('cs-CZ',{maximumFractionDigits:0,style:'currency',currency:'USD'});return'$'+n.toFixed(2)}
+let portDone=false;
+async function loadPortfolio(force){
+  if(portDone&&!force)return;portDone=true;
+  document.getElementById('p-content').style.display='none';
+  document.getElementById('p-no-key').style.display='none';
+  document.getElementById('perr').innerHTML='';
+  try{
+    const d=await fetch('/api/portfolio').then(r=>r.json());
+    document.getElementById('t212-meta').textContent=fage(d.updated_at);
+    if(d.error){
+      if(d.error.includes('T212_API_KEY')){
+        document.getElementById('p-no-key').style.display='block';
+      } else {
+        document.getElementById('perr').innerHTML=`<div class="err">${d.error}</div>`;
+      }
+      return;
+    }
+    document.getElementById('p-content').style.display='block';
+
+    // Summary metrics
+    const cash=d.cash||{};
+    const positions=d.positions||[];
+    const totalVal=positions.reduce((s,p)=>s+(p.current_val||0),0)+(cash.free||0);
+    const totalInv=positions.reduce((s,p)=>s+(p.invested||0),0);
+    const totalPnl=totalVal-(totalInv+(cash.free||0));
+    const pnlPct=totalInv>0?((totalPnl/totalInv)*100).toFixed(1):0;
+    document.getElementById('p-total').textContent=fmtVal(totalVal);
+    document.getElementById('p-invested').textContent=fmtVal(totalInv);
+    const pnlEl=document.getElementById('p-pnl');
+    pnlEl.textContent=(totalPnl>=0?'+':'')+fmtVal(totalPnl)+' ('+pnlPct+'%)';
+    pnlEl.style.color=totalPnl>=0?'var(--green)':'var(--red)';
+    document.getElementById('p-cash').textContent=fmtVal(cash.free||cash.cash||0);
+
+    // Pies
+    const pies=d.pies||[];
+    if(pies.length){
+      document.getElementById('pies-section').style.display='block';
+      let pr='';
+      for(const p of pies){
+        const pc=p.pnl_pct>=0?'up':'dn';
+        pr+=`<tr><td><strong>${p.name}</strong></td><td>${fmtVal(p.value)}</td><td>${fmtVal(p.invested)}</td><td class="${pc}">${p.pnl_pct>=0?'+':''}${p.pnl_pct}%</td><td style="color:var(--muted)">${p.slices} titulů</td></tr>`;
+      }
+      document.getElementById('pies-tb').innerHTML=pr;
+    }
+
+    // Positions
+    let posR='';
+    if(positions.length){
+      for(const p of positions){
+        const pc=p.pnl_pct>=0?'up':'dn';
+        const pot=p.potential!=null?`<span class="${p.potential>=0?'up':'dn'}">${p.potential>0?'+':''}${p.potential}%</span>`:'—';
+        const inPie=p.in_pie?'<span style="font-size:10px;color:var(--muted);margin-left:3px">🥧</span>':'';
+        posR+=`<tr>
+          <td><strong>${p.sym}</strong>${inPie}</td>
+          <td class="hm" style="color:var(--muted);font-size:12px">${p.quantity}</td>
+          <td>${fp(p.avg_price)}</td>
+          <td>${fp(p.current_price)}</td>
+          <td class="${pc}">${p.pnl_pct>=0?'+':''}${p.pnl_pct}%<br><span style="font-size:11px">${p.pnl>=0?'+':''}$${Math.abs(p.pnl).toFixed(0)}</span></td>
+          <td class="hm"><span class="badge ${bc(p.rec)}">${p.rec}</span></td>
+          <td class="hm">${p.target?fp(p.target):'—'}</td>
+          <td class="hm">${pot}</td>
+        </tr>`;
+      }
+    } else {
+      posR='<tr><td colspan="8" style="text-align:center;padding:20px;color:var(--muted)">Žádné pozice</td></tr>';
+    }
+    document.getElementById('pos-tb').innerHTML=posR;
+
+    // AI analysis
+    const aiEl=document.getElementById('p-ai');
+    if(d.ai_analysis){
+      aiEl.style.fontStyle='normal';
+      aiEl.style.color='var(--text)';
+      aiEl.textContent=d.ai_analysis;
+    } else {
+      aiEl.textContent='AI analýza není dostupná.';
+    }
+  }catch(e){
+    document.getElementById('perr').innerHTML=`<div class="err">Chyba: ${e.message}</div>`;
+  }
+}
 </script>
 </body>
 </html>"""
@@ -679,6 +1026,28 @@ def api_refresh():
 @app.route("/api/stocks/refresh", methods=["POST"])
 def api_stocks_refresh():
     refresh_stocks()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/portfolio")
+def api_portfolio():
+    if not T212_KEY:
+        return jsonify({"error": "Chybí T212_API_KEY v environment variables"})
+    # Always refresh on request (data is personal/live)
+    refresh_portfolio()
+    if portfolio_cache["error"]:
+        return jsonify({"error": portfolio_cache["error"]})
+    return jsonify({
+        **(portfolio_cache["data"] or {}),
+        "updated_at": portfolio_cache["updated_at"],
+    })
+
+
+@app.route("/api/portfolio/refresh", methods=["POST"])
+def api_portfolio_refresh():
+    if not T212_KEY:
+        return jsonify({"error": "Chybí T212_API_KEY"})
+    refresh_portfolio()
     return jsonify({"ok": True})
 
 
