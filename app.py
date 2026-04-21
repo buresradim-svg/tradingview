@@ -1096,6 +1096,28 @@ def api_stocks_refresh():
     return jsonify({"ok": True})
 
 
+@app.route("/api/debug/pies")
+def api_debug_pies():
+    """Temporary debug endpoint - shows raw T212 pie data to diagnose name fields."""
+    if not T212_KEY:
+        return jsonify({"error": "No T212_API_KEY"})
+    try:
+        pies_raw = t212_get("/equity/pies")
+        pies_list = pies_raw if isinstance(pies_raw, list) else pies_raw.get("items", [])
+        result = []
+        for pie in pies_list[:3]:  # only first 3 to keep it manageable
+            pie_id = pie.get("id")
+            detail = t212_get(f"/equity/pies/{pie_id}")
+            result.append({
+                "list_level": pie,
+                "detail_settings": detail.get("settings"),
+                "detail_keys": list(detail.keys()),
+            })
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route("/api/portfolio")
 def api_portfolio():
     import threading
