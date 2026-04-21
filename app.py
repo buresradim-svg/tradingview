@@ -487,20 +487,39 @@ def fetch_t212_portfolio():
 
 
 def enrich_with_finnhub(positions):
-    """Add current price, analyst rec and target from Finnhub for each position."""
+    """Parse T212 positions and enrich top 30 with Finnhub analyst data."""
     api_key = os.environ.get("FINNHUB_API_KEY", "")
     enriched = []
-    for pos in positions:
-        ticker_raw = pos.get("ticker", "")
-        # T212 tickers look like "AAPL_US_EQ" → extract base symbol
+
+    # Sort by walletImpact.currentValue descending — focus Finnhub calls on biggest positions
+    def sort_key(p):
+        return (p.get("walletImpact") or {}).get("currentValue") or 0
+    sorted_pos = sorted(positions, key=sort_key, reverse=True)
+
+    for idx, pos in enumerate(sorted_pos):
+        # T212 structure: instrument.ticker = "GOOG_US_EQ", instrument.name = "Alphabet (Class C)"
+        instrument = pos.get("instrument") or {}
+        ticker_raw = instrument.get("ticker") or pos.get("ticker") or ""
         sym = ticker_raw.split("_")[0] if "_" in ticker_raw else ticker_raw
-        
-        rec_label, target, analysts = "N/A", None, 0
-        current_price = pos.get("currentPrice")  # price in instrument's own currency
-        
-        if api_key and sym:
+        name = instrument.get("name") or sym
+        instr_currency = instrument.get("currency") or "USD"
+
+        # walletImpact has values in account currency (CZK)
+        wallet = pos.get("walletImpact") or {}
+        current_val_czk = wallet.get("currentValue") or 0
+        invested_czk = wallet.get("totalCost") or 0
+        pnl_czk = wallet.get("unrealizedProfitLoss") or 0
+        pnl_pct = round(pnl_czk / invested_czk * 100, 2) if invested_czk else 0
+
+        avg_price = pos.get("averagePricePaid") or 0
+        current_price = pos.get("currentPrice") or avg_price
+        quantity = pos.get("quantity") or 0
+
+        rec_label, target, potential, analysts = "N/A", None, None, 0
+
+        # Only call Finnhub for top 30 positions by value
+        if api_key and sym and idx < 30:
             try:
-                # Recommendation trends
                 rr = requests.get(
                     "https://finnhub.io/api/v1/stock/recommendation",
                     params={"symbol": sym, "token": api_key},
@@ -520,7 +539,6 @@ def enrich_with_finnhub(positions):
                             elif score <= 3.5:  rec_label = "Hold"
                             elif score <= 4.5:  rec_label = "Sell"
                             else:               rec_label = "Strong sell"
-                # Price target
                 rt = requests.get(
                     "https://finnhub.io/api/v1/stock/price-target",
                     params={"symbol": sym, "token": api_key},
@@ -529,29 +547,23 @@ def enrich_with_finnhub(positions):
                 if rt.status_code == 200:
                     pt = rt.json()
                     target = pt.get("targetMean")
+                    if target and current_price:
+                        potential = round((target - current_price) / current_price * 100, 1)
                 time.sleep(0.15)
             except Exception:
                 pass
 
-        avg_price = pos.get("averagePricePaid") or pos.get("averagePrice") or 0
-        quantity = pos.get("quantity", 0)
-        current = pos.get("currentPrice") or avg_price
-        invested = avg_price * quantity if avg_price and quantity else 0
-        current_val = current * quantity if current and quantity else invested
-        pnl = current_val - invested if invested else 0
-        pnl_pct = round(pnl / invested * 100, 2) if invested else 0
-        potential = round((target - current) / current * 100, 1) if target and current else None
-
         enriched.append({
             "ticker": ticker_raw,
             "sym": sym,
-            "name": (pos.get("instrument") or {}).get("name") or pos.get("fullName") or pos.get("name") or sym,
-            "quantity": round(quantity, 4) if quantity else 0,
+            "name": name,
+            "currency": instr_currency,
+            "quantity": round(quantity, 6) if quantity else 0,
             "avg_price": round(avg_price, 4) if avg_price else 0,
-            "current_price": round(current, 4) if current else 0,
-            "invested": round(invested, 2),
-            "current_val": round(current_val, 2),
-            "pnl": round(pnl, 2),
+            "current_price": round(current_price, 4) if current_price else 0,
+            "invested": round(invested_czk, 0),
+            "current_val": round(current_val_czk, 0),
+            "pnl": round(pnl_czk, 0),
             "pnl_pct": pnl_pct,
             "rec": rec_label,
             "target": round(target, 2) if target else None,
@@ -559,6 +571,9 @@ def enrich_with_finnhub(positions):
             "analysts": analysts,
             "in_pie": (pos.get("quantityInPies") or 0) > 0,
         })
+
+    # Sort final list by current value descending
+    enriched.sort(key=lambda x: x["current_val"], reverse=True)
     return enriched
 
 
@@ -570,13 +585,15 @@ def ask_claude_portfolio(positions_summary, cash_info):
         return None
     
     lines = []
-    for p in positions_summary:
+    # Only analyze top 20 by value to keep prompt reasonable
+    for p in positions_summary[:20]:
         pnl_str = f"{p['pnl_pct']:+.1f}%"
-        rec_str = f"analytici: {p['rec']}" if p['rec'] != 'N/A' else "analytici: bez dat"
-        target_str = f", cíl: ${p['target']}" if p['target'] else ""
+        rec_str = f"analytici: {p['rec']}" if p['rec'] != 'N/A' else ""
+        target_str = f", cil analytiků: ${p['target']}" if p['target'] else ""
+        czk_val = f"{int(p['current_val']):,} Kč" if p.get('current_val') else ""
         lines.append(
-            f"{p['sym']}: držíš {p['quantity']} ks, nákup ${p['avg_price']}, "
-            f"nyní ${p['current_price']} ({pnl_str}), {rec_str}{target_str}"
+            f"{p['sym']} ({p['name']}): {czk_val}, nákup ${p['avg_price']}, "
+            f"nyní ${p['current_price']} ({pnl_str}){(', '+rec_str) if rec_str else ''}{target_str}"
         )
     
     cash = cash_info.get("free") or cash_info.get("cash") or 0
@@ -848,8 +865,8 @@ tr:last-child td{border-bottom:none}
       </div>
       <div class="sec" style="margin-top:4px">Pozice</div>
       <div class="tw"><table>
-        <thead><tr><th>Ticker</th><th class="hm">Ks</th><th>Nákup</th><th>Nyní</th><th>P&amp;L</th><th class="hm">Konsenzus</th><th class="hm">Cíl</th><th class="hm">Potenciál</th></tr></thead>
-        <tbody id="pos-tb"><tr><td colspan="8" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
+        <thead><tr><th>Ticker</th><th class="hm">Název</th><th class="hm">Ks</th><th>Nákup $</th><th>Nyní $</th><th>P&amp;L (CZK)</th><th class="hm">Konsenzus</th><th class="hm">Cíl $</th><th class="hm">Potenciál</th></tr></thead>
+        <tbody id="pos-tb"><tr><td colspan="9" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
       </table></div>
       <div class="sec" style="margin-top:16px">AI analýza portfolia (Claude)</div>
       <div class="ai-box" id="p-ai" style="color:var(--muted);font-style:italic"><span class="sp"></span>Připravuji analýzu...</div>
@@ -999,19 +1016,22 @@ async function loadPortfolio(force){
         const pc=p.pnl_pct>=0?'up':'dn';
         const pot=p.potential!=null?`<span class="${p.potential>=0?'up':'dn'}">${p.potential>0?'+':''}${p.potential}%</span>`:'—';
         const inPie=p.in_pie?'<span style="font-size:10px;color:var(--muted);margin-left:3px">🥧</span>':'';
+        const czk=p.currency||'';
+        function fmtCzk(n){if(!n&&n!==0)return'—';return Math.round(n).toLocaleString('cs-CZ')+' Kč';}
         posR+=`<tr>
           <td><strong>${p.sym}</strong>${inPie}</td>
+          <td class="hm" style="font-size:12px;color:var(--muted)">${p.name}</td>
           <td class="hm" style="color:var(--muted);font-size:12px">${p.quantity}</td>
-          <td>${fp(p.avg_price)}</td>
-          <td>${fp(p.current_price)}</td>
-          <td class="${pc}">${p.pnl_pct>=0?'+':''}${p.pnl_pct}%<br><span style="font-size:11px">${p.pnl>=0?'+':''}$${Math.abs(p.pnl).toFixed(0)}</span></td>
+          <td style="font-size:12px">${fp(p.avg_price)}</td>
+          <td style="font-size:12px">${fp(p.current_price)}</td>
+          <td class="${pc}">${p.pnl_pct>=0?'+':''}${p.pnl_pct}%<br><span style="font-size:11px">${fmtCzk(p.pnl)}</span></td>
           <td class="hm"><span class="badge ${bc(p.rec)}">${p.rec}</span></td>
-          <td class="hm">${p.target?fp(p.target):'—'}</td>
+          <td class="hm" style="font-size:12px">${p.target?fp(p.target):'—'}</td>
           <td class="hm">${pot}</td>
         </tr>`;
       }
     } else {
-      posR='<tr><td colspan="8" style="text-align:center;padding:20px;color:var(--muted)">Žádné pozice</td></tr>';
+      posR='<tr><td colspan="9" style="text-align:center;padding:20px;color:var(--muted)">Žádné pozice</td></tr>';
     }
     document.getElementById('pos-tb').innerHTML=posR;
 
