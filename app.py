@@ -540,9 +540,11 @@ def enrich_with_finnhub(positions):
             except Exception:
                 pass
 
-        avg_price = pos.get("averagePrice") or pos.get("averagePricePaid", 0)
+        avg_price = (pos.get("averagePrice") or pos.get("averagePricePaid") or
+                     pos.get("avgPrice") or 0)
         quantity = pos.get("quantity", 0)
-        current = current_price or avg_price
+        current = (pos.get("currentPrice") or pos.get("currentPriceInAccountCurrency") or
+                   current_price or avg_price)
         invested = avg_price * quantity if avg_price and quantity else 0
         current_val = current * quantity if current and quantity else invested
         pnl = current_val - invested if invested else 0
@@ -642,15 +644,28 @@ def refresh_portfolio():
         # Process pies summary
         pies_summary = []
         for pie in pies:
-            settings = pie.get("settings") or pie.get("instrument") or {}
+            settings = pie.get("settings") or {}
             result = pie.get("result") or {}
             instruments = pie.get("instruments") or []
+            pie_id = pie.get("id") or settings.get("id") or ""
+            # Name: settings.name is the user-defined name (may be absent in API response)
+            # Fall back to settings.id or numeric ID
+            name = (settings.get("name") or "").strip()
+            if not name:
+                name = f"Kola\u010d {pie_id}"
+            # Values from correct API fields
+            value = result.get("priceAvgValue") or 0
+            invested = result.get("priceAvgInvestedValue") or 0
+            pnl_abs = result.get("priceAvgResult") or 0
+            pnl_coef = result.get("priceAvgResultCoef") or 0
+            pnl_pct = round(pnl_coef * 100, 2) if pnl_coef else 0
             pies_summary.append({
-                "id": pie.get("id"),
-                "name": settings.get("name") or pie.get("name") or f"Koláč {pie.get('id','')}",
-                "value": round(result.get("value") or pie.get("currentValue") or 0, 2),
-                "invested": round(result.get("investedValue") or pie.get("investedValue") or 0, 2),
-                "pnl_pct": round(result.get("returnPercentage") or 0, 2),
+                "id": pie_id,
+                "name": name,
+                "value": round(value, 2),
+                "invested": round(invested, 2),
+                "pnl": round(pnl_abs, 2),
+                "pnl_pct": pnl_pct,
                 "slices": len(instruments),
             })
         
@@ -956,8 +971,9 @@ async function loadPortfolio(force){
       document.getElementById('pies-section').style.display='block';
       let pr='';
       for(const p of pies){
-        const pc=p.pnl_pct>=0?'up':'dn';
-        pr+=`<tr><td><strong>${p.name}</strong></td><td>${fmtVal(p.value)}</td><td>${fmtVal(p.invested)}</td><td class="${pc}">${p.pnl_pct>=0?'+':''}${p.pnl_pct}%</td><td style="color:var(--muted)">${p.slices} titulů</td></tr>`;
+        const pc=(p.pnl_pct||0)>=0?'up':'dn';
+        const pnlStr=(p.pnl!=null&&p.pnl!==0)?` (${ p.pnl>=0?'+':'' }$${Math.abs(p.pnl).toFixed(0)})`:'';
+        pr+=`<tr><td><strong>${p.name}</strong></td><td>${fmtVal(p.value)}</td><td>${fmtVal(p.invested)}</td><td class="${pc}">${(p.pnl_pct>=0?'+':'')+p.pnl_pct}%${pnlStr}</td><td style="color:var(--muted)">${p.slices} titulů</td></tr>`;
       }
       document.getElementById('pies-tb').innerHTML=pr;
     }
