@@ -1003,6 +1003,7 @@ async function loadPortfolio(force){
     }
 
     // Positions
+    const positions=d.positions||[];
     let posR='';
     if(positions.length){
       for(const p of positions){
