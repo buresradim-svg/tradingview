@@ -249,14 +249,28 @@ def fetch_patria_recommendations():
         for row in rows:
             cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
             clean = [re.sub(r'<[^>]+>', '', c).strip().replace('\xa0', ' ') for c in cells]
-            if len(clean) >= 4 and clean[0] and clean[0] not in ('Název CP', '') and len(clean[0]) > 1:
+            # Columns: 0=Název, 1=Aktuální dop., 2=Předchozí dop., 3=Analýza(Ano/odkaz), 4=Cena, 5=Cíl 12M, 6=Potenciál
+            if len(clean) >= 5 and clean[0] and clean[0] not in ('Název CP', '') and len(clean[0]) > 1:
+                # Calculate potential from price and target if not provided or garbled
+                price_str = clean[4] if len(clean) > 4 else ''
+                target_str = clean[5] if len(clean) > 5 else ''
+                potential_str = clean[6] if len(clean) > 6 else ''
+                # Try to compute potential if we have both prices
+                try:
+                    price_num = float(price_str.replace(' ','').replace(' ','').replace(',','.'))
+                    target_num = float(target_str.replace(' ','').replace(' ','').replace(',','.'))
+                    if price_num > 0 and target_num > 0:
+                        computed = round((target_num - price_num) / price_num * 100, 2)
+                        potential_str = f"{computed:+.2f}%"
+                except Exception:
+                    pass
                 results_cz.append({
                     "name": clean[0],
                     "rec": clean[1] if len(clean) > 1 else '',
                     "rec_prev": clean[2] if len(clean) > 2 else '',
-                    "price": clean[3] if len(clean) > 3 else '',
-                    "target": clean[4] if len(clean) > 4 else '',
-                    "potential": clean[5] if len(clean) > 5 else '',
+                    "price": price_str,
+                    "target": target_str,
+                    "potential": potential_str,
                 })
 
     # ── Monitoring: find the table with Název CP | Společnost | Nové doporučení columns ──
