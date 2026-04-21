@@ -35,7 +35,7 @@ US_STOCKS = [
 # ── Caches ───────────────────────────────────────────────────────────────────
 crypto_cache = {"data": None, "updated_at": None, "updating": False, "error": None}
 stocks_cache = {"patria": None, "world": None, "patria_at": None, "world_at": None}
-portfolio_cache = {"data": None, "updated_at": None, "error": None}
+portfolio_cache = {"data": None, "updated_at": None, "error": None, "updating": False}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -623,6 +623,9 @@ def ask_claude_portfolio(positions_summary, cash_info):
 
 def refresh_portfolio():
     """Main function to refresh T212 portfolio data."""
+    if portfolio_cache["updating"]:
+        return
+    portfolio_cache["updating"] = True
     portfolio_cache["error"] = None
     try:
         raw = fetch_t212_portfolio()
@@ -660,6 +663,8 @@ def refresh_portfolio():
         portfolio_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         portfolio_cache["error"] = str(e)
+    finally:
+        portfolio_cache["updating"] = False
 
 
 
@@ -914,8 +919,15 @@ async function loadPortfolio(force){
   try{
     const d=await fetch('/api/portfolio').then(r=>r.json());
     document.getElementById('t212-meta').textContent=fage(d.updated_at);
+    if(d.loading){
+      document.getElementById('perr').innerHTML=`<div class="info" style="display:block"><span class="sp"></span>${d.message}</div>`;
+      document.getElementById('p-content').style.display='none';
+      // Auto-retry after 15 seconds
+      setTimeout(()=>loadPortfolio(true), 15000);
+      return;
+    }
     if(d.error){
-      if(d.error.includes('T212_API_KEY')){
+      if(d.error.includes('T212_API_KEY')||d.error.includes('Chybi T212_API_KEY')){
         document.getElementById('p-no-key').style.display='block';
       } else {
         document.getElementById('perr').innerHTML=`<div class="err">${d.error}</div>`;
@@ -1045,24 +1057,33 @@ def api_stocks_refresh():
 
 @app.route("/api/portfolio")
 def api_portfolio():
+    import threading
     if not T212_KEY:
-        return jsonify({"error": "Chybí T212_API_KEY v environment variables"})
-    # Always refresh on request (data is personal/live)
-    refresh_portfolio()
+        return jsonify({"error": "Chybi T212_API_KEY v environment variables"})
+    # If no data yet and not loading, start background refresh
+    if portfolio_cache["data"] is None and not portfolio_cache["updating"]:
+        threading.Thread(target=refresh_portfolio, daemon=True).start()
+        return jsonify({"loading": True, "message": "Portfolio se nacita, zkus za 60 sekund..."})
+    # If loading in progress
+    if portfolio_cache["updating"]:
+        return jsonify({"loading": True, "message": "Portfolio se nacita..."})
     if portfolio_cache["error"]:
         return jsonify({"error": portfolio_cache["error"]})
     return jsonify({
         **(portfolio_cache["data"] or {}),
         "updated_at": portfolio_cache["updated_at"],
+        "updating": False,
     })
 
 
 @app.route("/api/portfolio/refresh", methods=["POST"])
 def api_portfolio_refresh():
+    import threading
     if not T212_KEY:
-        return jsonify({"error": "Chybí T212_API_KEY"})
-    refresh_portfolio()
-    return jsonify({"ok": True})
+        return jsonify({"error": "Chybi T212_API_KEY"})
+    if not portfolio_cache["updating"]:
+        threading.Thread(target=refresh_portfolio, daemon=True).start()
+    return jsonify({"ok": True, "loading": True})
 
 
 if __name__ == "__main__":
