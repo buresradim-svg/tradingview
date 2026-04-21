@@ -433,6 +433,19 @@ T212_KEY = os.environ.get("T212_API_KEY", "")
 T212_SECRET = os.environ.get("T212_API_SECRET", "")
 T212_BASE = "https://live.trading212.com/api/v0"
 
+# Pie name mapping (ID → name) — list endpoint doesn't include names
+T212_PIE_NAMES = {
+    7350157: "Swing - hlídat",
+    3137533: "RADIM_2024 AI Stocks",
+    3325280: "Radim US",
+    3681873: "Radim Cheapest S&P 500",
+    5070610: "Radim - Energy",
+    3971151: "China Tech",
+    4051076: "Pharma + Tesla",
+    3137526: "Radim (Almost) Daily Dividends",
+    3994699: "Energy/Bank US",
+}
+
 def t212_get(path):
     """Make authenticated GET request to Trading 212 API.
     Supports both Basic Auth (key+secret) and direct token.
@@ -465,34 +478,12 @@ def t212_get(path):
 
 def fetch_t212_portfolio():
     """Fetch all positions + pies from Trading 212."""
-    # Account summary - has currency, totalValue, investments breakdown
     summary = t212_get("/equity/account/summary")
-    
-    # All open positions - returns list directly
     positions_raw = t212_get("/equity/positions")
     positions = positions_raw if isinstance(positions_raw, list) else positions_raw.get("items", [])
-
-    # All pies - list with basic info
     pies_raw = t212_get("/equity/pies")
     pies_list = pies_raw if isinstance(pies_raw, list) else pies_raw.get("items", [])
-    
-    # Enrich each pie with detail (has settings.name, instruments, result)
-    pies_detail = []
-    for pie in pies_list[:15]:
-        try:
-            pie_id = pie.get("id")
-            detail = t212_get(f"/equity/pies/{pie_id}")
-            # Merge list-level data into detail
-            detail["_list_data"] = pie
-            pies_detail.append(detail)
-        except Exception:
-            pies_detail.append(pie)
-
-    return {
-        "summary": summary,
-        "positions": positions,
-        "pies": pies_detail,
-    }
+    return {"summary": summary, "positions": positions, "pies": pies_list}
 
 
 def enrich_with_finnhub(positions):
@@ -660,20 +651,17 @@ def refresh_portfolio():
         # Process pies summary
         pies_summary = []
         for pie in pies:
-            settings = pie.get("settings") or {}
+            # List endpoint has: id, cash, result{priceAvgValue etc}, dividendDetails, status
             result = pie.get("result") or {}
-            list_data = pie.get("_list_data") or {}
-            instruments = pie.get("instruments") or []
-            pie_id = pie.get("id") or settings.get("id") or list_data.get("id") or ""
-            name = (settings.get("name") or "").strip()
-            if not name:
-                name = f"Kola\u010d {pie_id}"
-            # result fields from detailed endpoint
+            pie_id = pie.get("id") or 0
+            # Use our local name mapping — API list doesn't include names
+            name = T212_PIE_NAMES.get(pie_id) or T212_PIE_NAMES.get(int(pie_id) if pie_id else 0) or f"Kolac {pie_id}"
             value = result.get("priceAvgValue") or 0
             invested = result.get("priceAvgInvestedValue") or 0
             pnl_abs = result.get("priceAvgResult") or 0
             pnl_coef = result.get("priceAvgResultCoef") or 0
             pnl_pct = round(pnl_coef * 100, 2) if pnl_coef else 0
+            dividends = (pie.get("dividendDetails") or {}).get("gained") or 0
             pies_summary.append({
                 "id": pie_id,
                 "name": name,
@@ -681,7 +669,8 @@ def refresh_portfolio():
                 "invested": round(invested, 2),
                 "pnl": round(pnl_abs, 2),
                 "pnl_pct": pnl_pct,
-                "slices": len(instruments),
+                "dividends": round(dividends, 2),
+                "slices": 0,
                 "currency": currency,
             })
         
@@ -853,7 +842,7 @@ tr:last-child td{border-bottom:none}
       <div id="pies-section" style="display:none">
         <div class="sec" style="margin-top:4px">Koláče (Pies)</div>
         <div class="tw"><table>
-          <thead><tr><th>Název</th><th>Hodnota</th><th>Investováno</th><th>P&amp;L</th><th>Počet titulů</th></tr></thead>
+          <thead><tr><th>Název</th><th>Hodnota</th><th>Investováno</th><th>P&amp;L</th><th>Dividendy</th></tr></thead>
           <tbody id="pies-tb"></tbody>
         </table></div>
       </div>
@@ -997,7 +986,7 @@ async function loadPortfolio(force){
         const c=p.currency||summ.currency||'';
         function fmtP(n){if(!n&&n!==0)return'—';return Math.abs(n).toLocaleString('cs-CZ',{maximumFractionDigits:0})+' '+c;}
         const pnlStr=(p.pnl!=null&&p.pnl!==0)?` (${ p.pnl>=0?'+':'' }${fmtP(p.pnl)})`:'';
-        pr+=`<tr><td><strong>${p.name}</strong></td><td>${fmtP(p.value)}</td><td>${fmtP(p.invested)}</td><td class="${pc}">${(p.pnl_pct>=0?'+':'')+p.pnl_pct}%${pnlStr}</td><td style="color:var(--muted)">${p.slices} titulů</td></tr>`;
+        const divStr=p.dividends>0?fmtP(p.dividends):'—';pr+=`<tr><td><strong>${p.name}</strong></td><td>${fmtP(p.value)}</td><td>${fmtP(p.invested)}</td><td class="${pc}">${(p.pnl_pct>=0?'+':'')+p.pnl_pct}%${pnlStr}</td><td style="color:var(--green);font-size:12px">${divStr}</td></tr>`;
       }
       document.getElementById('pies-tb').innerHTML=pr;
     }
