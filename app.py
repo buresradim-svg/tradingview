@@ -491,10 +491,17 @@ def enrich_with_finnhub(positions):
     api_key = os.environ.get("FINNHUB_API_KEY", "")
     enriched = []
 
-    # Sort by walletImpact.currentValue descending — focus Finnhub calls on biggest positions
+    # Filter: only positions NOT fully in pies (free/mixed positions)
+    free_positions = [p for p in positions if (p.get("quantityAvailableForTrading") or 0) > 0
+                      or (p.get("quantityInPies") or 0) == 0]
+    # If no free positions found, show all
+    if not free_positions:
+        free_positions = positions
+
+    # Sort by value descending
     def sort_key(p):
         return (p.get("walletImpact") or {}).get("currentValue") or 0
-    sorted_pos = sorted(positions, key=sort_key, reverse=True)
+    sorted_pos = sorted(free_positions, key=sort_key, reverse=True)
 
     for idx, pos in enumerate(sorted_pos):
         # T212 structure: instrument.ticker = "GOOG_US_EQ", instrument.name = "Alphabet (Class C)"
@@ -517,8 +524,8 @@ def enrich_with_finnhub(positions):
 
         rec_label, target, potential, analysts = "N/A", None, None, 0
 
-        # Only call Finnhub for top 30 positions by value
-        if api_key and sym and idx < 30:
+        # Call Finnhub for all free positions
+        if api_key and sym:
             try:
                 rr = requests.get(
                     "https://finnhub.io/api/v1/stock/recommendation",
@@ -546,10 +553,12 @@ def enrich_with_finnhub(positions):
                 )
                 if rt.status_code == 200:
                     pt = rt.json()
-                    target = pt.get("targetMean")
-                    if target and current_price:
-                        potential = round((target - current_price) / current_price * 100, 1)
-                time.sleep(0.15)
+                    target_val = pt.get("targetMean") or pt.get("targetHigh")
+                    if target_val and float(target_val) > 0:
+                        target = float(target_val)
+                        if current_price and current_price > 0:
+                            potential = round((target - current_price) / current_price * 100, 1)
+                time.sleep(0.2)
             except Exception:
                 pass
 
@@ -660,7 +669,7 @@ def refresh_portfolio():
         }
         
         # Enrich positions with Finnhub data (limit to 20)
-        enriched = enrich_with_finnhub(positions[:20])
+        enriched = enrich_with_finnhub(positions)
         
         # Get Claude analysis
         ai = ask_claude_portfolio(enriched, cash_info)
