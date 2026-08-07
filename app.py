@@ -619,26 +619,31 @@ def ask_claude_portfolio(positions_summary, cash_info):
         "Na konci 2-3 vety o celkovem portfoliu. Pis cesky, strucne, konkretne."
     )
     
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-5",
-                "max_tokens": 1500,
-                "system": "Jsi osobní investiční analytik. Analyzuješ reálné portfolio a dáváš konkrétní, stručná doporučení. Nepoužívej obecné fráze. Vždy uveď jasné KOUPIT/DRŽET/PRODAT.",
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=45,
-        )
-        r.raise_for_status()
-        return r.json()["content"][0]["text"]
-    except Exception as e:
-        return f"Chyba Claude API: {e}"
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1500,
+                    "system": "Jsi osobní investiční analytik. Analyzuješ reálné portfolio a dáváš konkrétní, stručná doporučení. Nepoužívej obecné fráze. Vždy uveď jasné KOUPIT/DRŽET/PRODAT.",
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=110,
+            )
+            r.raise_for_status()
+            return r.json()["content"][0]["text"]
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                continue
+            return "Chyba Claude API: analýza portfolia trvala příliš dlouho (timeout i po opakovaném pokusu). Zkus obnovit portfolio znovu."
+        except Exception as e:
+            return f"Chyba Claude API: {e}"
 
 
 def refresh_portfolio():
