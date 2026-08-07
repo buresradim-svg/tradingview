@@ -3,7 +3,7 @@ import re
 import time
 import requests
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
@@ -770,6 +770,15 @@ tr:last-child td{border-bottom:none}
 .hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
 .hdr-l{display:flex;align-items:center;gap:6px;font-weight:500;font-size:14px}
 .sm{font-size:12px;color:var(--muted);font-weight:400}
+.chat-window{background:var(--card);border:0.5px solid var(--border);border-radius:10px;padding:16px;min-height:320px;max-height:520px;overflow-y:auto;margin-bottom:10px;display:flex;flex-direction:column;gap:12px}
+.chat-msg{max-width:82%;padding:9px 13px;border-radius:12px;line-height:1.55;font-size:13px;white-space:pre-wrap}
+.chat-msg.user{align-self:flex-end;background:var(--blue);color:#fff;border-bottom-right-radius:3px}
+.chat-msg.assistant{align-self:flex-start;background:var(--bg);border:0.5px solid var(--border);border-bottom-left-radius:3px}
+.chat-empty{color:var(--muted);font-size:13px;text-align:center;padding:30px 10px;font-style:italic}
+.chat-input-row{display:flex;gap:8px;align-items:flex-end}
+.chat-input{flex:1;resize:none;border:0.5px solid var(--border);border-radius:10px;padding:10px 12px;font-family:inherit;font-size:13px;background:var(--card);color:var(--text)}
+.chat-input:focus{outline:none;border-color:var(--blue)}
+.chat-send{padding:10px 18px;white-space:nowrap}
 @media(max-width:600px){.hm{display:none}td,th{padding:7px 7px}}
 </style>
 </head>
@@ -781,6 +790,7 @@ tr:last-child td{border-bottom:none}
     <button class="tab" onclick="sw('cz',this)">Akcie CZ (Patria)</button>
     <button class="tab" onclick="sw('us',this)">Akcie US (Yahoo)</button>
     <button class="tab" onclick="sw('portfolio',this)">Moje portfolio (T212)</button>
+    <button class="tab" onclick="sw('chat',this)">Chat s Claude</button>
   </div>
 
   <!-- CRYPTO -->
@@ -881,6 +891,21 @@ tr:last-child td{border-bottom:none}
       <div class="ai-box" id="p-ai" style="color:var(--muted);font-style:italic"><span class="sp"></span>Připravuji analýzu...</div>
     </div>
     <p class="note" style="margin-top:12px">Data z Trading 212 API · Toto není finanční poradenství.</p>
+  </div>
+
+  <!-- CHAT TAB -->
+  <div id="tab-chat" class="tab-content">
+    <div class="hdr">
+      <div class="hdr-l">Chat s Claude</div>
+      <button class="btn" onclick="clearChat()">Nový chat</button>
+    </div>
+    <div class="info">Claude vidí aktuální data z ostatních tabů — krypto signály, akciová doporučení i tvé portfolio. Zeptej se na cokoliv.</div>
+    <div id="chat-window" class="chat-window"></div>
+    <div class="chat-input-row">
+      <textarea id="chat-input" class="chat-input" placeholder="Zeptej se na titul, doporučení, nebo cokoliv o dashboardu..." rows="2"></textarea>
+      <button class="btn chat-send" id="chat-send-btn" onclick="sendChat()">Odeslat</button>
+    </div>
+    <p class="note">Toto není finanční poradenství.</p>
   </div>
 
 </div>
@@ -1057,6 +1082,76 @@ async function loadPortfolio(force){
     document.getElementById('perr').innerHTML=`<div class="err">Chyba: ${e.message}</div>`;
   }
 }
+
+// ── Chat ─────────────────────────────────────────────────────────────────────
+let chatHistory=[];
+function renderChat(){
+  const win=document.getElementById('chat-window');
+  if(chatHistory.length===0){
+    win.innerHTML='<div class="chat-empty">Zeptej se třeba: "Proč jsi doporučil DRŽET u GOOG?" nebo "Porovnej BTC a ETH signály"</div>';
+    return;
+  }
+  win.innerHTML=chatHistory.map(m=>
+    `<div class="chat-msg ${m.role}">${escapeHtml(m.content)}</div>`
+  ).join('');
+  win.scrollTop=win.scrollHeight;
+}
+function escapeHtml(s){
+  const d=document.createElement('div');
+  d.textContent=s;
+  return d.innerHTML;
+}
+function clearChat(){
+  chatHistory=[];
+  renderChat();
+}
+async function sendChat(){
+  const input=document.getElementById('chat-input');
+  const msg=input.value.trim();
+  if(!msg)return;
+  const btn=document.getElementById('chat-send-btn');
+  chatHistory.push({role:'user',content:msg});
+  renderChat();
+  input.value='';
+  btn.disabled=true;
+  btn.textContent='...';
+  // Show typing indicator
+  chatHistory.push({role:'assistant',content:'…'});
+  renderChat();
+  try{
+    const historyForApi=chatHistory.slice(0,-1);
+    const r=await fetch('/api/chat',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:msg,history:historyForApi.slice(0,-1)})
+    });
+    const d=await r.json();
+    chatHistory.pop(); // remove typing indicator
+    if(d.error){
+      chatHistory.push({role:'assistant',content:'Chyba: '+d.error});
+    }else{
+      chatHistory.push({role:'assistant',content:d.reply});
+    }
+  }catch(e){
+    chatHistory.pop();
+    chatHistory.push({role:'assistant',content:'Chyba připojení: '+e.message});
+  }
+  renderChat();
+  btn.disabled=false;
+  btn.textContent='Odeslat';
+}
+document.addEventListener('DOMContentLoaded',function(){
+  renderChat();
+  const input=document.getElementById('chat-input');
+  if(input){
+    input.addEventListener('keydown',function(e){
+      if(e.key==='Enter'&&!e.shiftKey){
+        e.preventDefault();
+        sendChat();
+      }
+    });
+  }
+});
 </script>
 </body>
 </html>"""
@@ -1190,6 +1285,125 @@ def api_portfolio_refresh():
     if not portfolio_cache["updating"]:
         threading.Thread(target=refresh_portfolio, daemon=True).start()
     return jsonify({"ok": True, "loading": True})
+
+
+def build_chat_context():
+    """Build a compact summary of current dashboard data for the chat system prompt."""
+    parts = []
+
+    # Crypto
+    cdata = crypto_cache.get("data")
+    if cdata:
+        coin_lines = [
+            f"{c['sym']}: ${c['price']:,.2f} ({c['change_24h']:+.1f}%), RSI={c['rsi']}, "
+            f"TV={c['tv_rec']}, signal={c['signal']}"
+            for c in cdata.get("coins", [])
+        ]
+        parts.append("KRYPTO SIGNALY:\n" + "\n".join(coin_lines))
+        if cdata.get("ai_analysis"):
+            parts.append("KRYPTO AI ANALYZA (drivejsi vygenerovana):\n" + cdata["ai_analysis"])
+
+    # US stocks
+    world = stocks_cache.get("world")
+    if world:
+        stock_lines = [
+            f"{s['sym']} ({s.get('name','')}): ${s.get('price')}, {s.get('change_24h',0):+.1f}%, "
+            f"konsenzus={s.get('rec')}, cil=${s.get('target')}"
+            for s in world[:20]
+        ]
+        parts.append("US AKCIE (Finnhub konsenzus):\n" + "\n".join(stock_lines))
+
+    # Patria CZ
+    patria = stocks_cache.get("patria")
+    if patria and patria.get("cz"):
+        cz_lines = [
+            f"{s['name']}: {s.get('rec')}, cena={s.get('price')}, cil={s.get('target')}"
+            for s in patria["cz"][:20]
+        ]
+        parts.append("CESKE AKCIE (Patria):\n" + "\n".join(cz_lines))
+
+    # Portfolio
+    pdata = portfolio_cache.get("data")
+    if pdata:
+        summ = pdata.get("summary") or {}
+        parts.append(
+            f"MOJE PORTFOLIO (Trading 212): celkova hodnota {summ.get('total_value')} "
+            f"{summ.get('currency','')}, investovano {summ.get('total_invested')}, "
+            f"P&L {summ.get('unrealized_pnl')}"
+        )
+        pos_lines = [
+            f"{p['sym']} ({p['name']}): drzi {p['quantity']} ks, nakup ${p['avg_price']}, "
+            f"nyni ${p['current_price']} ({p['pnl_pct']:+.1f}%), konsenzus={p.get('rec')}, "
+            f"cil=${p.get('target')}, potencial={p.get('potential')}%"
+            for p in pdata.get("positions", [])[:40]
+        ]
+        parts.append("MOJE POZICE:\n" + "\n".join(pos_lines))
+        pie_lines = [
+            f"{p['name']}: hodnota {p['value']} {p.get('currency','')}, P&L {p['pnl_pct']:+.1f}%"
+            for p in pdata.get("pies", [])
+        ]
+        if pie_lines:
+            parts.append("MOJE KOLACE:\n" + "\n".join(pie_lines))
+        if pdata.get("ai_analysis"):
+            parts.append("PORTFOLIO AI ANALYZA (drivejsi vygenerovana):\n" + pdata["ai_analysis"])
+
+    return "\n\n".join(parts) if parts else "Zadna data zatim nejsou nactena v dashboardu."
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"error": "Chybi ANTHROPIC_API_KEY"})
+
+    body = request.get_json(force=True) or {}
+    user_message = (body.get("message") or "").strip()
+    history = body.get("history") or []
+
+    if not user_message:
+        return jsonify({"error": "Prazdna zprava"})
+
+    context = build_chat_context()
+
+    system_prompt = (
+        "Jsi osobni investicni asistent v investicnim dashboardu uzivatele. "
+        "Mas pristup k aktualnim datum z dashboardu (krypto signaly, US a CZ akcie, "
+        "a osobni portfolio z Trading 212 vcetne drivejsich AI doporuceni). "
+        "Uzivatel se muze ptat na konkretni tituly, chtit vysvetlit drivejsi doporuceni, "
+        "nebo porovnavat moznosti. Odpovidej cesky, konkretne a strucne. "
+        "Pokud se otazka tyka udaje ktery v datech nemas, rekni to primo misto vymysleni.\n\n"
+        "AKTUALNI DATA Z DASHBOARDU:\n" + context
+    )
+
+    # Build message list: history + new message
+    messages = []
+    for h in history[-20:]:  # keep last 20 turns to limit context size
+        role = h.get("role")
+        content = h.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1200,
+                "system": system_prompt,
+                "messages": messages,
+            },
+            timeout=40,
+        )
+        r.raise_for_status()
+        reply = r.json()["content"][0]["text"]
+        return jsonify({"reply": reply})
+    except Exception as e:
+        return jsonify({"error": f"Chyba Claude API: {e}"})
 
 
 if __name__ == "__main__":
