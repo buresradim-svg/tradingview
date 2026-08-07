@@ -36,6 +36,7 @@ US_STOCKS = [
 crypto_cache = {"data": None, "updated_at": None, "updating": False, "error": None}
 stocks_cache = {"patria": None, "world": None, "patria_at": None, "world_at": None}
 portfolio_cache = {"data": None, "updated_at": None, "error": None, "updating": False}
+pie_detail_cache = {"data": None, "updated_at": None, "error": None, "updating": False, "progress": {"done": 0, "total": 0}}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -720,6 +721,173 @@ def refresh_portfolio():
         portfolio_cache["updating"] = False
 
 
+def get_finnhub_rec_for_symbol(sym, finnhub_cache):
+    """Get Finnhub recommendation + target for a symbol, using a local dict to avoid duplicate calls."""
+    if sym in finnhub_cache:
+        return finnhub_cache[sym]
+    api_key = os.environ.get("FINNHUB_API_KEY", "")
+    result = {"rec": "N/A", "target": None, "analysts": 0}
+    if api_key and sym:
+        try:
+            rr = requests.get(
+                "https://finnhub.io/api/v1/stock/recommendation",
+                params={"symbol": sym, "token": api_key},
+                timeout=8,
+            )
+            if rr.status_code == 200:
+                trends = rr.json()
+                if trends:
+                    t = trends[0]
+                    sb, b, h, s, ss = (t.get("strongBuy",0), t.get("buy",0),
+                                       t.get("hold",0), t.get("sell",0), t.get("strongSell",0))
+                    analysts = sb + b + h + s + ss
+                    if analysts > 0:
+                        score = (sb*1 + b*2 + h*3 + s*4 + ss*5) / analysts
+                        if score <= 1.5:    rec = "Strong buy"
+                        elif score <= 2.5:  rec = "Buy"
+                        elif score <= 3.5:  rec = "Hold"
+                        elif score <= 4.5:  rec = "Sell"
+                        else:               rec = "Strong sell"
+                        result["rec"] = rec
+                        result["analysts"] = analysts
+            rt = requests.get(
+                "https://finnhub.io/api/v1/stock/price-target",
+                params={"symbol": sym, "token": api_key},
+                timeout=8,
+            )
+            if rt.status_code == 200:
+                pt = rt.json()
+                target_val = pt.get("targetMean") or pt.get("targetHigh")
+                if target_val and float(target_val) > 0:
+                    result["target"] = float(target_val)
+            time.sleep(0.2)
+        except Exception:
+            pass
+    finnhub_cache[sym] = result
+    return result
+
+
+def ask_claude_pie_rebalance(pies_breakdown):
+    """Ask Claude for rebalancing suggestions across all pies."""
+    if not ANTHROPIC_API_KEY or not pies_breakdown:
+        return None
+
+    lines = []
+    for pie in pies_breakdown:
+        lines.append(f"\nKOLAC: {pie['name']}")
+        for ins in pie["instruments"]:
+            dev = ins["current_share"] - ins["expected_share"]
+            dev_str = f"odchylka od cile {dev:+.1f}pb" if abs(dev) > 0.5 else "na cili"
+            rec_str = f", analytici: {ins['rec']}" if ins["rec"] != "N/A" else ""
+            lines.append(
+                f"  {ins['sym']}: podil {ins['current_share']:.1f}% (cil {ins['expected_share']:.1f}%, {dev_str}), "
+                f"hodnota {ins['value']:.0f}, P&L {ins['pnl_pct']:+.1f}%{rec_str}"
+            )
+
+    prompt = (
+        "Toto jsou moje investicni kolace (pies) v Trading 212 s jednotlivymi tituly, "
+        "jejich aktualnim a cilovym podilem, a doporucenim analytiku:\n" +
+        "\n".join(lines) +
+        "\n\nPro kazdy kolac, kde vidis prilezitost ke zlepseni, navrhni konkretni akci: "
+        "zmenit rozlozeni (ktery titul snizit/zvysit) nebo vymenit titul za jiny "
+        "(pokud ma titul spatne doporuceni analytiku nebo velkou odchylku od cile). "
+        "Kolace ktere jsou v poradku preskoc strucnou poznamkou. "
+        "Pis cesky, konkretne, bez zbytecnych uvodu."
+    )
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 2000,
+                "system": "Jsi investicni analytik specializovany na portfolio rebalancing. Davas konkretni, akcni doporuceni.",
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()["content"][0]["text"]
+    except Exception as e:
+        return f"Chyba Claude API: {e}"
+
+
+def refresh_pie_details():
+    """Fetch instrument-level breakdown for every pie. Respects T212's 1 req/30s rate limit
+    on the pie detail endpoint, so this takes several minutes for multiple pies."""
+    if pie_detail_cache["updating"]:
+        return
+    pie_detail_cache["updating"] = True
+    pie_detail_cache["error"] = None
+    try:
+        pie_ids = list(T212_PIE_NAMES.keys())
+        pie_detail_cache["progress"] = {"done": 0, "total": len(pie_ids)}
+
+        # Build ticker→name lookup from cached positions to enrich instrument names
+        name_lookup = {}
+        pdata = portfolio_cache.get("data")
+        if pdata:
+            for p in pdata.get("positions", []):
+                name_lookup[p["ticker"]] = p["name"]
+
+        finnhub_cache = {}
+        pies_breakdown = []
+
+        for i, pie_id in enumerate(pie_ids):
+            try:
+                detail = t212_get(f"/equity/pies/{pie_id}")
+                instruments_raw = detail.get("instruments") or []
+                settings = detail.get("settings") or {}
+                name = T212_PIE_NAMES.get(pie_id) or settings.get("name") or f"Kolac {pie_id}"
+
+                instruments = []
+                for ins in instruments_raw:
+                    ticker_raw = ins.get("ticker", "")
+                    sym = ticker_raw.split("_")[0] if "_" in ticker_raw else ticker_raw
+                    result = ins.get("result") or {}
+                    owned_qty = ins.get("ownedQuantity") or 0
+                    if owned_qty <= 0:
+                        continue  # skip zero/delisted holdings
+                    fh = get_finnhub_rec_for_symbol(sym, finnhub_cache)
+                    instruments.append({
+                        "sym": sym,
+                        "name": name_lookup.get(ticker_raw, sym),
+                        "current_share": round((ins.get("currentShare") or 0) * 100, 2),
+                        "expected_share": round((ins.get("expectedShare") or 0) * 100, 2),
+                        "value": result.get("priceAvgValue") or 0,
+                        "invested": result.get("priceAvgInvestedValue") or 0,
+                        "pnl_pct": round((result.get("priceAvgResultCoef") or 0) * 100, 2),
+                        "rec": fh["rec"],
+                        "target": fh["target"],
+                    })
+
+                instruments.sort(key=lambda x: x["value"], reverse=True)
+                pies_breakdown.append({"id": pie_id, "name": name, "instruments": instruments})
+            except Exception:
+                pass
+
+            pie_detail_cache["progress"] = {"done": i + 1, "total": len(pie_ids)}
+            if i < len(pie_ids) - 1:
+                time.sleep(30)  # respect T212 rate limit: 1 req / 30s
+
+        ai_rebalance = ask_claude_pie_rebalance(pies_breakdown)
+
+        pie_detail_cache["data"] = {
+            "pies": pies_breakdown,
+            "ai_rebalance": ai_rebalance,
+        }
+        pie_detail_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
+    except Exception as e:
+        pie_detail_cache["error"] = str(e)
+    finally:
+        pie_detail_cache["updating"] = False
+
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="cs">
@@ -889,6 +1057,21 @@ tr:last-child td{border-bottom:none}
       </table></div>
       <div class="sec" style="margin-top:16px">AI analýza portfolia (Claude)</div>
       <div class="ai-box" id="p-ai" style="color:var(--muted);font-style:italic"><span class="sp"></span>Připravuji analýzu...</div>
+
+      <div class="sec" style="margin-top:16px">Rozpad koláčů na jednotlivé tituly</div>
+      <div class="info">Zobrazí každý titul uvnitř koláčů — aktuální vs. cílový podíl, výkonnost a doporučení analytiků. Kvůli limitům Trading 212 API trvá analýza cca 5 minut.</div>
+      <div id="pie-detail-idle">
+        <button class="btn" onclick="startPieAnalysis()">Analyzovat složení koláčů (~5 min)</button>
+      </div>
+      <div id="pie-detail-progress" style="display:none" class="info">
+        <span class="sp"></span><span id="pie-progress-text">Analyzuji...</span>
+      </div>
+      <div id="pie-detail-content" style="display:none">
+        <div id="pie-breakdown-tables"></div>
+        <div class="sec" style="margin-top:14px">Doporučení k rebalancingu (Claude)</div>
+        <div class="ai-box" id="pie-ai-rebalance"></div>
+        <button class="btn" style="margin-top:10px" onclick="startPieAnalysis()">Přeanalyzovat ↻</button>
+      </div>
     </div>
     <p class="note" style="margin-top:12px">Data z Trading 212 API · Toto není finanční poradenství.</p>
   </div>
@@ -926,7 +1109,7 @@ function sw(id,btn){
   document.getElementById('tab-'+id).classList.add('active');
   btn.classList.add('active');
   if(id==='cz'||id==='us')loadStocks();
-  if(id==='portfolio')loadPortfolio();
+  if(id==='portfolio'){loadPortfolio();checkPieStatusOnLoad();}
 }
 async function loadCrypto(){
   document.getElementById('dot').className='dot upd';
@@ -1081,6 +1264,85 @@ async function loadPortfolio(force){
   }catch(e){
     document.getElementById('perr').innerHTML=`<div class="err">Chyba: ${e.message}</div>`;
   }
+}
+
+// ── Pie breakdown ────────────────────────────────────────────────────────────
+let pieCheckInterval=null;
+async function startPieAnalysis(){
+  document.getElementById('pie-detail-idle').style.display='none';
+  document.getElementById('pie-detail-content').style.display='none';
+  document.getElementById('pie-detail-progress').style.display='block';
+  document.getElementById('pie-progress-text').textContent='Spouštím analýzu...';
+  try{
+    await fetch('/api/pie-details/refresh',{method:'POST'});
+  }catch(e){}
+  if(pieCheckInterval)clearInterval(pieCheckInterval);
+  pieCheckInterval=setInterval(checkPieDetails,10000);
+  checkPieDetails();
+}
+async function checkPieDetails(){
+  try{
+    const d=await fetch('/api/pie-details').then(r=>r.json());
+    if(d.not_started){
+      document.getElementById('pie-detail-idle').style.display='block';
+      document.getElementById('pie-detail-progress').style.display='none';
+      return;
+    }
+    if(d.loading){
+      const prog=d.progress||{done:0,total:0};
+      document.getElementById('pie-progress-text').textContent=`Analyzuji koláč ${prog.done}/${prog.total}... (cca 30s na koláč)`;
+      return;
+    }
+    if(d.error){
+      document.getElementById('pie-detail-progress').style.display='none';
+      document.getElementById('pie-detail-idle').style.display='block';
+      document.getElementById('pie-detail-idle').innerHTML=`<div class="err">${d.error}</div><button class="btn" onclick="startPieAnalysis()">Zkusit znovu</button>`;
+      if(pieCheckInterval)clearInterval(pieCheckInterval);
+      return;
+    }
+    // Done — render results
+    if(pieCheckInterval)clearInterval(pieCheckInterval);
+    document.getElementById('pie-detail-progress').style.display='none';
+    document.getElementById('pie-detail-content').style.display='block';
+    renderPieBreakdown(d);
+  }catch(e){}
+}
+function renderPieBreakdown(d){
+  const pies=d.pies||[];
+  let html='';
+  for(const pie of pies){
+    if(!pie.instruments||!pie.instruments.length)continue;
+    html+=`<div class="sec" style="margin-top:14px">${pie.name}</div><div class="tw"><table>
+      <thead><tr><th>Ticker</th><th class="hm">Název</th><th>Podíl</th><th class="hm">Cíl</th><th>P&amp;L</th><th>Konsenzus</th></tr></thead><tbody>`;
+    for(const ins of pie.instruments){
+      const dev=Math.abs(ins.current_share-ins.expected_share);
+      const devStyle=dev>3?'color:var(--red);font-weight:500':'color:var(--muted)';
+      const pc=ins.pnl_pct>=0?'up':'dn';
+      html+=`<tr><td><strong>${ins.sym}</strong></td><td class="hm" style="font-size:12px;color:var(--muted)">${ins.name}</td>
+        <td style="${devStyle}">${ins.current_share}%</td><td class="hm" style="color:var(--muted)">${ins.expected_share}%</td>
+        <td class="${pc}">${ins.pnl_pct>=0?'+':''}${ins.pnl_pct}%</td><td><span class="badge ${bc(ins.rec)}">${ins.rec}</span></td></tr>`;
+    }
+    html+='</tbody></table></div>';
+  }
+  document.getElementById('pie-breakdown-tables').innerHTML=html||'<p class="note">Žádné aktivní tituly v koláčích.</p>';
+  const aiEl=document.getElementById('pie-ai-rebalance');
+  aiEl.textContent=d.ai_rebalance||'Doporučení není dostupné.';
+}
+// Check if pie analysis already ran/in progress on tab open
+async function checkPieStatusOnLoad(){
+  try{
+    const d=await fetch('/api/pie-details').then(r=>r.json());
+    if(d.loading){
+      document.getElementById('pie-detail-idle').style.display='none';
+      document.getElementById('pie-detail-progress').style.display='block';
+      if(pieCheckInterval)clearInterval(pieCheckInterval);
+      pieCheckInterval=setInterval(checkPieDetails,10000);
+    }else if(!d.not_started&&!d.error){
+      document.getElementById('pie-detail-idle').style.display='none';
+      document.getElementById('pie-detail-content').style.display='block';
+      renderPieBreakdown(d);
+    }
+  }catch(e){}
 }
 
 // ── Chat ─────────────────────────────────────────────────────────────────────
@@ -1287,6 +1549,32 @@ def api_portfolio_refresh():
     return jsonify({"ok": True, "loading": True})
 
 
+@app.route("/api/pie-details")
+def api_pie_details():
+    if not T212_KEY:
+        return jsonify({"error": "Chybi T212_API_KEY"})
+    if pie_detail_cache["updating"]:
+        return jsonify({"loading": True, "progress": pie_detail_cache["progress"]})
+    if pie_detail_cache["error"]:
+        return jsonify({"error": pie_detail_cache["error"]})
+    if pie_detail_cache["data"] is None:
+        return jsonify({"not_started": True})
+    return jsonify({
+        **pie_detail_cache["data"],
+        "updated_at": pie_detail_cache["updated_at"],
+    })
+
+
+@app.route("/api/pie-details/refresh", methods=["POST"])
+def api_pie_details_refresh():
+    import threading
+    if not T212_KEY:
+        return jsonify({"error": "Chybi T212_API_KEY"})
+    if not pie_detail_cache["updating"]:
+        threading.Thread(target=refresh_pie_details, daemon=True).start()
+    return jsonify({"ok": True, "loading": True})
+
+
 def build_chat_context():
     """Build a compact summary of current dashboard data for the chat system prompt."""
     parts = []
@@ -1346,6 +1634,22 @@ def build_chat_context():
             parts.append("MOJE KOLACE:\n" + "\n".join(pie_lines))
         if pdata.get("ai_analysis"):
             parts.append("PORTFOLIO AI ANALYZA (drivejsi vygenerovana):\n" + pdata["ai_analysis"])
+
+    # Pie instrument-level breakdown (if available)
+    pie_details = pie_detail_cache.get("data")
+    if pie_details:
+        pd_lines = []
+        for pie in pie_details.get("pies", []):
+            pd_lines.append(f"\n{pie['name']}:")
+            for ins in pie.get("instruments", []):
+                pd_lines.append(
+                    f"  {ins['sym']}: podil {ins['current_share']}% (cil {ins['expected_share']}%), "
+                    f"P&L {ins['pnl_pct']:+.1f}%, konsenzus={ins['rec']}"
+                )
+        if pd_lines:
+            parts.append("ROZPAD KOLACU NA JEDNOTLIVE TITULY:\n" + "\n".join(pd_lines))
+        if pie_details.get("ai_rebalance"):
+            parts.append("DOPORUCENI K REBALANCINGU KOLACU (drivejsi vygenerovane):\n" + pie_details["ai_rebalance"])
 
     return "\n\n".join(parts) if parts else "Zadna data zatim nejsou nactena v dashboardu."
 
