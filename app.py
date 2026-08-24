@@ -5,9 +5,33 @@ import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
+try:
+    from composio import Composio
+except ImportError:
+    Composio = None
+
 app = Flask(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# ── Composio / Patria newsletter config ─────────────────────────────────────
+COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
+# ID of the Composio user that owns your connected accounts. CLI-created
+# connections default to "default" - verify with `composio whoami`, or by
+# checking `composio connected-accounts list --toolkits gmail` if emails fail.
+COMPOSIO_USER_ID = os.environ.get("COMPOSIO_USER_ID", "default")
+# The connected_account_id for your PERSONAL Gmail (not the mamutex one).
+# Find it with: composio connected-accounts list --toolkits gmail
+COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID = os.environ.get("COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID", "")
+
+_composio_client = None
+
+
+def get_composio():
+    global _composio_client
+    if _composio_client is None and Composio and COMPOSIO_API_KEY:
+        _composio_client = Composio(api_key=COMPOSIO_API_KEY)
+    return _composio_client
 
 # ── Crypto config ────────────────────────────────────────────────────────────
 COINS = [
@@ -587,7 +611,99 @@ def enrich_with_finnhub(positions):
     return enriched
 
 
-def ask_claude_portfolio(positions_summary, cash_info):
+def strip_html(html):
+    """Lightweight HTML-to-text: drop scripts/styles, strip tags, collapse whitespace."""
+    html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", html)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
+def _decode_gmail_body(payload):
+    """Extract text/plain (preferred) or text/html body from a Gmail message payload."""
+    import base64
+
+    def b64url_decode(data):
+        data = data.replace("-", "+").replace("_", "/")
+        pad = len(data) % 4
+        if pad:
+            data += "=" * (4 - pad)
+        return base64.b64decode(data).decode("utf-8", errors="ignore")
+
+    def walk(part, mime_type):
+        if not part:
+            return None
+        body = part.get("body", {}) or {}
+        if part.get("mimeType") == mime_type and body.get("data"):
+            return b64url_decode(body["data"])
+        for sub in part.get("parts", []) or []:
+            found = walk(sub, mime_type)
+            if found:
+                return found
+        return None
+
+    if not payload:
+        return ""
+    plain = walk(payload, "text/plain")
+    if plain:
+        return plain.strip()
+    html = walk(payload, "text/html")
+    if html:
+        return strip_html(html)
+    body = payload.get("body", {}) or {}
+    if body.get("data"):
+        return strip_html(b64url_decode(body["data"]))
+    return ""
+
+
+def fetch_patria_newsletter_summary(days_back=14, max_emails=12, max_chars_per_email=2000):
+    """Fetch recent Patria CZ newsletters from the personal Gmail (via Composio) and
+    return a compact text block for the Claude prompt. Returns None on failure/absence
+    so the rest of the portfolio analysis always still runs without it."""
+    client = get_composio()
+    if not client:
+        return None
+    if not COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID:
+        return None
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y/%m/%d")
+        result = client.tools.execute(
+            "GMAIL_FETCH_EMAILS",
+            user_id=COMPOSIO_USER_ID,
+            connected_account_id=COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID,
+            arguments={
+                "query": f"from:patria after:{since}",
+                "max_results": max_emails,
+                "verbose": True,
+                "include_payload": True,
+            },
+        )
+        data = result.get("data") if isinstance(result, dict) else None
+        messages = (data or {}).get("messages") or []
+        if not messages:
+            return None
+
+        messages.sort(key=lambda m: m.get("messageTimestamp", ""), reverse=True)
+
+        blocks = []
+        for m in messages[:max_emails]:
+            subject = (m.get("subject") or "").strip()
+            ts = (m.get("messageTimestamp") or "")[:10]
+            body_text = _decode_gmail_body(m.get("payload"))
+            if not body_text:
+                body_text = (m.get("preview") or {}).get("body", "")
+            body_text = body_text[:max_chars_per_email]
+            if body_text:
+                blocks.append(f"[{ts}] {subject}\n{body_text}")
+
+        return "\n\n---\n\n".join(blocks) if blocks else None
+    except Exception as e:
+        return f"(Patria newslettery se nepodarilo nacist: {e})"
+
+
+def ask_claude_portfolio(positions_summary, cash_info, newsletter_context=None):
     """Ask Claude to analyze the portfolio and give buy/hold/sell per position."""
     if not ANTHROPIC_API_KEY:
         return None
@@ -611,9 +727,20 @@ def ask_claude_portfolio(positions_summary, cash_info):
     
     cash_str = f"{cash:.0f}"
     portfolio_lines = "\n".join(lines)
+
+    newsletter_block = ""
+    if newsletter_context:
+        newsletter_block = (
+            "\n\nNedavne Patria CZ newslettery (trzni komentare a doporuceni z posledních dnu):\n"
+            + newsletter_context +
+            "\n\nPokud newslettery zminuji nektery z mych titulu nebo relevantni makro temata, "
+            "zohledni to v doporucenich nize."
+        )
+
     prompt = (
         f"Moje portfolio (volna hotovost: ${cash_str}):\n" +
         portfolio_lines +
+        newsletter_block +
         "\n\nPro kazdou pozici dej doporuceni KOUPIT / DRZET / PRODAT. "
         "Format: [TICKER]: [DOPORUCENI] - [3-4 vety: duvod, rizika, co sledovat]. "
         "Na konci 2-3 vety o celkovem portfoliu. Pis cesky, strucne, konkretne."
@@ -676,9 +803,12 @@ def refresh_portfolio():
         
         # Enrich positions with Finnhub data (limit to 20)
         enriched = enrich_with_finnhub(positions)
-        
+
+        # Pull recent Patria CZ newsletter commentary (best-effort, never blocks the refresh)
+        newsletter_context = fetch_patria_newsletter_summary()
+
         # Get Claude analysis
-        ai = ask_claude_portfolio(enriched, cash_info)
+        ai = ask_claude_portfolio(enriched, cash_info, newsletter_context)
         
         # Process pies summary
         pies_summary = []
@@ -718,6 +848,7 @@ def refresh_portfolio():
                 "currency": currency,
             },
             "ai_analysis": ai,
+            "newsletter_context": newsletter_context,
         }
         portfolio_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
@@ -1639,6 +1770,8 @@ def build_chat_context():
             parts.append("MOJE KOLACE:\n" + "\n".join(pie_lines))
         if pdata.get("ai_analysis"):
             parts.append("PORTFOLIO AI ANALYZA (drivejsi vygenerovana):\n" + pdata["ai_analysis"])
+        if pdata.get("newsletter_context"):
+            parts.append("NEDAVNE PATRIA CZ NEWSLETTERY:\n" + pdata["newsletter_context"])
 
     # Pie instrument-level breakdown (if available)
     pie_details = pie_detail_cache.get("data")
