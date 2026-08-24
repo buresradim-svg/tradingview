@@ -1654,6 +1654,25 @@ def api_debug_pies():
         return jsonify({"error": str(e)})
 
 
+@app.route("/api/debug/newsletter")
+def api_debug_newsletter():
+    """Temporary debug endpoint - directly tests the Composio/Patria newsletter fetch."""
+    if not Composio:
+        return jsonify({"error": "composio balicek neni nainstalovany (pridej 'composio' do requirements.txt)"})
+    if not COMPOSIO_API_KEY:
+        return jsonify({"error": "Chybi COMPOSIO_API_KEY v environment variables"})
+    if not COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID:
+        return jsonify({"error": "Chybi COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID v environment variables"})
+    result = fetch_patria_newsletter_summary()
+    return jsonify({
+        "composio_user_id": COMPOSIO_USER_ID,
+        "composio_gmail_account_id": COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID,
+        "found_data": result is not None,
+        "length_chars": len(result) if result else 0,
+        "preview": (result[:1500] if result else None),
+    })
+
+
 @app.route("/api/portfolio")
 def api_portfolio():
     import threading
