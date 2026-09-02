@@ -5,33 +5,9 @@ import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
-try:
-    from composio import Composio
-except ImportError:
-    Composio = None
-
 app = Flask(__name__)
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-
-# ── Composio / Patria newsletter config ─────────────────────────────────────
-COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
-# ID of the Composio user that owns your connected accounts. CLI-created
-# connections default to "default" - verify with `composio whoami`, or by
-# checking `composio connected-accounts list --toolkits gmail` if emails fail.
-COMPOSIO_USER_ID = os.environ.get("COMPOSIO_USER_ID", "default")
-# The connected_account_id for your PERSONAL Gmail (not the mamutex one).
-# Find it with: composio connected-accounts list --toolkits gmail
-COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID = os.environ.get("COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID", "")
-
-_composio_client = None
-
-
-def get_composio():
-    global _composio_client
-    if _composio_client is None and Composio and COMPOSIO_API_KEY:
-        _composio_client = Composio(api_key=COMPOSIO_API_KEY)
-    return _composio_client
 
 # ── Crypto config ────────────────────────────────────────────────────────────
 COINS = [
@@ -611,99 +587,7 @@ def enrich_with_finnhub(positions):
     return enriched
 
 
-def strip_html(html):
-    """Lightweight HTML-to-text: drop scripts/styles, strip tags, collapse whitespace."""
-    html = re.sub(r"(?is)<(script|style).*?</\1>", " ", html)
-    text = re.sub(r"(?s)<[^>]+>", " ", html)
-    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n", text)
-    return text.strip()
-
-
-def _decode_gmail_body(payload):
-    """Extract text/plain (preferred) or text/html body from a Gmail message payload."""
-    import base64
-
-    def b64url_decode(data):
-        data = data.replace("-", "+").replace("_", "/")
-        pad = len(data) % 4
-        if pad:
-            data += "=" * (4 - pad)
-        return base64.b64decode(data).decode("utf-8", errors="ignore")
-
-    def walk(part, mime_type):
-        if not part:
-            return None
-        body = part.get("body", {}) or {}
-        if part.get("mimeType") == mime_type and body.get("data"):
-            return b64url_decode(body["data"])
-        for sub in part.get("parts", []) or []:
-            found = walk(sub, mime_type)
-            if found:
-                return found
-        return None
-
-    if not payload:
-        return ""
-    plain = walk(payload, "text/plain")
-    if plain:
-        return plain.strip()
-    html = walk(payload, "text/html")
-    if html:
-        return strip_html(html)
-    body = payload.get("body", {}) or {}
-    if body.get("data"):
-        return strip_html(b64url_decode(body["data"]))
-    return ""
-
-
-def fetch_patria_newsletter_summary(days_back=14, max_emails=12, max_chars_per_email=2000):
-    """Fetch recent Patria CZ newsletters from the personal Gmail (via Composio) and
-    return a compact text block for the Claude prompt. Returns None on failure/absence
-    so the rest of the portfolio analysis always still runs without it."""
-    client = get_composio()
-    if not client:
-        return None
-    if not COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID:
-        return None
-    try:
-        since = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y/%m/%d")
-        result = client.tools.execute(
-            "GMAIL_FETCH_EMAILS",
-            user_id=COMPOSIO_USER_ID,
-            connected_account_id=COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID,
-            arguments={
-                "query": f"from:patria after:{since}",
-                "max_results": max_emails,
-                "verbose": True,
-                "include_payload": True,
-            },
-        )
-        data = result.get("data") if isinstance(result, dict) else None
-        messages = (data or {}).get("messages") or []
-        if not messages:
-            return None
-
-        messages.sort(key=lambda m: m.get("messageTimestamp", ""), reverse=True)
-
-        blocks = []
-        for m in messages[:max_emails]:
-            subject = (m.get("subject") or "").strip()
-            ts = (m.get("messageTimestamp") or "")[:10]
-            body_text = _decode_gmail_body(m.get("payload"))
-            if not body_text:
-                body_text = (m.get("preview") or {}).get("body", "")
-            body_text = body_text[:max_chars_per_email]
-            if body_text:
-                blocks.append(f"[{ts}] {subject}\n{body_text}")
-
-        return "\n\n---\n\n".join(blocks) if blocks else None
-    except Exception as e:
-        return f"(Patria newslettery se nepodarilo nacist: {e})"
-
-
-def ask_claude_portfolio(positions_summary, cash_info, newsletter_context=None):
+def ask_claude_portfolio(positions_summary, cash_info):
     """Ask Claude to analyze the portfolio and give buy/hold/sell per position."""
     if not ANTHROPIC_API_KEY:
         return None
@@ -727,20 +611,9 @@ def ask_claude_portfolio(positions_summary, cash_info, newsletter_context=None):
     
     cash_str = f"{cash:.0f}"
     portfolio_lines = "\n".join(lines)
-
-    newsletter_block = ""
-    if newsletter_context:
-        newsletter_block = (
-            "\n\nNedavne Patria CZ newslettery (trzni komentare a doporuceni z posledních dnu):\n"
-            + newsletter_context +
-            "\n\nPokud newslettery zminuji nektery z mych titulu nebo relevantni makro temata, "
-            "zohledni to v doporucenich nize."
-        )
-
     prompt = (
         f"Moje portfolio (volna hotovost: ${cash_str}):\n" +
         portfolio_lines +
-        newsletter_block +
         "\n\nPro kazdou pozici dej doporuceni KOUPIT / DRZET / PRODAT. "
         "Format: [TICKER]: [DOPORUCENI] - [3-4 vety: duvod, rizika, co sledovat]. "
         "Na konci 2-3 vety o celkovem portfoliu. Pis cesky, strucne, konkretne."
@@ -803,12 +676,9 @@ def refresh_portfolio():
         
         # Enrich positions with Finnhub data (limit to 20)
         enriched = enrich_with_finnhub(positions)
-
-        # Pull recent Patria CZ newsletter commentary (best-effort, never blocks the refresh)
-        newsletter_context = fetch_patria_newsletter_summary()
-
+        
         # Get Claude analysis
-        ai = ask_claude_portfolio(enriched, cash_info, newsletter_context)
+        ai = ask_claude_portfolio(enriched, cash_info)
         
         # Process pies summary
         pies_summary = []
@@ -848,7 +718,6 @@ def refresh_portfolio():
                 "currency": currency,
             },
             "ai_analysis": ai,
-            "newsletter_context": newsletter_context,
         }
         portfolio_cache["updated_at"] = datetime.now(timezone.utc).isoformat()
     except Exception as e:
@@ -1246,6 +1115,7 @@ function sw(id,btn){
   btn.classList.add('active');
   if(id==='cz'||id==='us')loadStocks();
   if(id==='portfolio'){loadPortfolio();checkPieStatusOnLoad();}
+  if(id==='chat'){loadPortfolio();loadStocks();}
 }
 async function loadCrypto(){
   document.getElementById('dot').className='dot upd';
@@ -1503,6 +1373,14 @@ function clearChat(){
   chatHistory=[];
   renderChat();
 }
+async function sendChatRequest(msg,historyForApi){
+  const r=await fetch('/api/chat',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({message:msg,history:historyForApi})
+  });
+  return await r.json();
+}
 async function sendChat(){
   const input=document.getElementById('chat-input');
   const msg=input.value.trim();
@@ -1516,23 +1394,25 @@ async function sendChat(){
   // Show typing indicator
   chatHistory.push({role:'assistant',content:'…'});
   renderChat();
-  try{
-    const historyForApi=chatHistory.slice(0,-1);
-    const r=await fetch('/api/chat',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({message:msg,history:historyForApi.slice(0,-1)})
-    });
-    const d=await r.json();
-    chatHistory.pop(); // remove typing indicator
-    if(d.error){
-      chatHistory.push({role:'assistant',content:'Chyba: '+d.error});
-    }else{
-      chatHistory.push({role:'assistant',content:d.reply});
+  const historyForApi=chatHistory.slice(0,-2);
+  let d=null,lastErr=null;
+  for(let attempt=0;attempt<2;attempt++){
+    try{
+      d=await sendChatRequest(msg,historyForApi);
+      lastErr=null;
+      break;
+    }catch(e){
+      lastErr=e;
+      if(attempt===0)await new Promise(res=>setTimeout(res,1500)); // brief pause before retry
     }
-  }catch(e){
-    chatHistory.pop();
-    chatHistory.push({role:'assistant',content:'Chyba připojení: '+e.message});
+  }
+  chatHistory.pop(); // remove typing indicator
+  if(lastErr){
+    chatHistory.push({role:'assistant',content:'Spojení se serverem selhalo, zkus prosím odeslat zprávu znovu.'});
+  }else if(d.error){
+    chatHistory.push({role:'assistant',content:'Chyba: '+d.error});
+  }else{
+    chatHistory.push({role:'assistant',content:d.reply});
   }
   renderChat();
   btn.disabled=false;
@@ -1654,25 +1534,6 @@ def api_debug_pies():
         return jsonify({"error": str(e)})
 
 
-@app.route("/api/debug/newsletter")
-def api_debug_newsletter():
-    """Temporary debug endpoint - directly tests the Composio/Patria newsletter fetch."""
-    if not Composio:
-        return jsonify({"error": "composio balicek neni nainstalovany (pridej 'composio' do requirements.txt)"})
-    if not COMPOSIO_API_KEY:
-        return jsonify({"error": "Chybi COMPOSIO_API_KEY v environment variables"})
-    if not COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID:
-        return jsonify({"error": "Chybi COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID v environment variables"})
-    result = fetch_patria_newsletter_summary()
-    return jsonify({
-        "composio_user_id": COMPOSIO_USER_ID,
-        "composio_gmail_account_id": COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID,
-        "found_data": result is not None,
-        "length_chars": len(result) if result else 0,
-        "preview": (result[:1500] if result else None),
-    })
-
-
 @app.route("/api/portfolio")
 def api_portfolio():
     import threading
@@ -1789,8 +1650,6 @@ def build_chat_context():
             parts.append("MOJE KOLACE:\n" + "\n".join(pie_lines))
         if pdata.get("ai_analysis"):
             parts.append("PORTFOLIO AI ANALYZA (drivejsi vygenerovana):\n" + pdata["ai_analysis"])
-        if pdata.get("newsletter_context"):
-            parts.append("NEDAVNE PATRIA CZ NEWSLETTERY:\n" + pdata["newsletter_context"])
 
     # Pie instrument-level breakdown (if available)
     pie_details = pie_detail_cache.get("data")
@@ -1813,27 +1672,52 @@ def build_chat_context():
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
+    import threading
     if not ANTHROPIC_API_KEY:
         return jsonify({"error": "Chybi ANTHROPIC_API_KEY"})
 
-    body = request.get_json(force=True) or {}
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "Neplatny pozadavek"})
+
     user_message = (body.get("message") or "").strip()
     history = body.get("history") or []
 
     if not user_message:
         return jsonify({"error": "Prazdna zprava"})
 
+    # If any data source is empty (e.g. server just restarted), kick off a background
+    # refresh so it becomes available for the NEXT message, and let Claude know it's loading.
+    loading_notes = []
+    if crypto_cache.get("data") is None and not crypto_cache.get("updating"):
+        threading.Thread(target=refresh_crypto, daemon=True).start()
+        loading_notes.append("krypto signaly se prave nacitaji")
+    if stocks_cache.get("world") is None and stocks_cache.get("patria") is None:
+        threading.Thread(target=refresh_stocks, daemon=True).start()
+        loading_notes.append("akciova doporuceni se prave nacitaji")
+    if T212_KEY and portfolio_cache.get("data") is None and not portfolio_cache.get("updating"):
+        threading.Thread(target=refresh_portfolio, daemon=True).start()
+        loading_notes.append("portfolio Trading 212 se prave nacita (muze trvat 1-2 minuty)")
+
     context = build_chat_context()
 
     system_prompt = (
         "Jsi osobni investicni asistent v investicnim dashboardu uzivatele. "
-        "Mas pristup k aktualnim datum z dashboardu (krypto signaly, US a CZ akcie, "
-        "a osobni portfolio z Trading 212 vcetne drivejsich AI doporuceni). "
+        "Dashboard ma zalozky: Krypto, Akcie CZ (Patria), Akcie US (Finnhub), "
+        "Moje portfolio (Trading 212) a tento Chat. "
+        "Mas pristup k datum, ktera jsou aktualne nactena v pameti serveru — "
+        "NIKDY netvrd ze zalozka 'neexistuje' nebo ze k ni nemas pristup jako k funkci. "
+        "Pokud pro nejakou zalozku (napr. portfolio) v datech nize nevidis zadny obsah, "
+        "znamena to jen ze se jeste nenacetla nebo prave probiha nacitani na pozadi — "
+        "rekni uzivateli aby otevrel danou zalozku v dashboardu (napr. 'Moje portfolio (T212)') "
+        "a pockal, nez se data nactou, pripadne zkusil dotaz znovu za chvili. "
         "Uzivatel se muze ptat na konkretni tituly, chtit vysvetlit drivejsi doporuceni, "
-        "nebo porovnavat moznosti. Odpovidej cesky, konkretne a strucne. "
-        "Pokud se otazka tyka udaje ktery v datech nemas, rekni to primo misto vymysleni.\n\n"
+        "nebo porovnavat moznosti. Odpovidej cesky, konkretne a strucne.\n\n"
         "AKTUALNI DATA Z DASHBOARDU:\n" + context
     )
+    if loading_notes:
+        system_prompt += "\n\nPOZNAMKA - prave se na pozadi nacita: " + ", ".join(loading_notes) + "."
 
     # Build message list: history + new message
     messages = []
