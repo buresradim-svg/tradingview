@@ -1520,6 +1520,26 @@ def api_debug_positions():
         return jsonify({"error": str(e)})
 
 
+@app.route("/api/debug/pie-composition")
+def api_debug_pie_composition():
+    """Verify that T212 returns instrument-level composition for one pie."""
+    if not T212_KEY:
+        return jsonify({"error": "No T212_API_KEY"})
+    try:
+        first_id = list(T212_PIE_NAMES.keys())[0]
+        detail = t212_get(f"/equity/pies/{first_id}")
+        instruments = detail.get("instruments") or []
+        return jsonify({
+            "pie_id": first_id,
+            "pie_name": T212_PIE_NAMES.get(first_id),
+            "instrument_count": len(instruments),
+            "first_instrument": instruments[0] if instruments else None,
+            "all_tickers": [i.get("ticker") for i in instruments],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route("/api/debug/pies-list")
 def api_debug_pies_list():
     """Shows raw T212 pie LIST (no detail calls, no rate limit issues)."""
@@ -1715,6 +1735,23 @@ def build_chat_context():
             parts.append(f"ROZPAD KOLACU NA JEDNOTLIVE TITULY (aktualizovano {pd_age}):\n" + "\n".join(pd_lines))
         if pie_details.get("ai_rebalance"):
             parts.append("DOPORUCENI K REBALANCINGU KOLACU (drivejsi vygenerovane, stejne stari jako vyse):\n" + pie_details["ai_rebalance"])
+    elif pie_detail_cache.get("updating"):
+        prog = pie_detail_cache.get("progress") or {}
+        parts.append(
+            f"ROZPAD KOLACU NA JEDNOTLIVE TITULY: prave se nacita na pozadi "
+            f"({prog.get('done', 0)}/{prog.get('total', 0)} kolacu hotovo). "
+            "Trading 212 API slozeni kolacu POSKYTUJE, jen ma limit 1 pozadavek za 30 sekund, "
+            "takze nacteni vsech kolacu trva nekolik minut. Rekni uzivateli at pocka a zeptá se znovu."
+        )
+    else:
+        parts.append(
+            "ROZPAD KOLACU NA JEDNOTLIVE TITULY: jeste nebyl nacten v teto session. "
+            "DULEZITE: Trading 212 API slozeni kolacu POSKYTUJE (endpoint /equity/pies/{id} vraci "
+            "jednotlive tituly, jejich aktualni a cilovy podil). NIKDY netvrd ze to API neumi. "
+            "Data se jen nacitaji zvlast, protoze API ma limit 1 pozadavek za 30 sekund. "
+            "Rekni uzivateli at v zalozce 'Moje portfolio (T212)' klikne na tlacitko "
+            "'Analyzovat slozeni kolacu' a pocka cca 5 minut — pak budes mit kompletni slozeni vsech kolacu."
+        )
 
     return "\n\n".join(parts) if parts else "Zadna data zatim nejsou nactena v dashboardu."
 
@@ -1748,6 +1785,9 @@ def api_chat():
     if T212_KEY and portfolio_cache.get("data") is None and not portfolio_cache.get("updating"):
         threading.Thread(target=refresh_portfolio, daemon=True).start()
         loading_notes.append("portfolio Trading 212 se prave nacita (muze trvat 1-2 minuty)")
+    if T212_KEY and pie_detail_cache.get("data") is None and not pie_detail_cache.get("updating"):
+        threading.Thread(target=refresh_pie_details, daemon=True).start()
+        loading_notes.append("slozeni kolacu se prave nacita na pozadi (cca 5 minut, kvuli limitu T212 API)")
 
     context = build_chat_context()
 
