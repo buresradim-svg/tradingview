@@ -970,7 +970,7 @@ tr:last-child td{border-bottom:none}
   <div id="tab-crypto" class="tab-content active">
     <div class="hdr">
       <div class="hdr-l"><span class="dot" id="dot"></span>Crypto signály <span class="sm" id="crypto-meta"></span></div>
-      <button class="btn" onclick="loadCrypto()">Obnovit ↻</button>
+      <button class="btn" onclick="forceRefreshCrypto()">Obnovit ↻</button>
     </div>
     <div id="cerr"></div>
     <div class="top-grid">
@@ -1035,7 +1035,7 @@ tr:last-child td{border-bottom:none}
   <div id="tab-portfolio" class="tab-content">
     <div class="hdr">
       <div class="hdr-l">Moje portfolio — Trading 212 <span class="sm" id="t212-meta"></span></div>
-      <button class="btn" onclick="loadPortfolio(true)">Obnovit ↻</button>
+      <button class="btn" onclick="forceRefreshPortfolio()">Obnovit ↻</button>
     </div>
     <div id="perr"></div>
     <div id="p-no-key" style="display:none" class="info">
@@ -1117,6 +1117,14 @@ function sw(id,btn){
   if(id==='portfolio'){loadPortfolio();checkPieStatusOnLoad();}
   if(id==='chat'){loadPortfolio();loadStocks();}
 }
+async function forceRefreshCrypto(){
+  const dot=document.getElementById('dot');
+  dot.className='dot upd';
+  try{
+    await fetch('/api/refresh',{method:'POST'});
+  }catch(e){}
+  await loadCrypto();
+}
 async function loadCrypto(){
   document.getElementById('dot').className='dot upd';
   try{
@@ -1178,6 +1186,12 @@ setInterval(loadCrypto,60*60*1000);
 // ── Portfolio ────────────────────────────────────────────────────────────────
 function fmtVal(n){if(!n&&n!==0)return'—';if(Math.abs(n)>=1000)return n.toLocaleString('cs-CZ',{maximumFractionDigits:0,style:'currency',currency:'USD'});return'$'+n.toFixed(2)}
 let portDone=false;
+async function forceRefreshPortfolio(){
+  try{
+    await fetch('/api/portfolio/refresh',{method:'POST'});
+  }catch(e){}
+  await loadPortfolio(true);
+}
 async function loadPortfolio(force){
   if(portDone&&!force)return;portDone=true;
   document.getElementById('p-content').style.display='none';
@@ -1446,8 +1460,14 @@ def index():
 
 @app.route("/api/data")
 def api_data():
+    import threading
     if crypto_cache["data"] is None and not crypto_cache["updating"]:
         refresh_crypto()
+    elif crypto_cache["updated_at"] and not crypto_cache["updating"]:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(crypto_cache["updated_at"])
+        if age > timedelta(minutes=65):
+            # Data is stale — refresh in background, but still return current data immediately
+            threading.Thread(target=refresh_crypto, daemon=True).start()
     if crypto_cache["error"] and crypto_cache["data"] is None:
         return jsonify({"error": crypto_cache["error"]})
     return jsonify({
@@ -1548,6 +1568,11 @@ def api_portfolio():
         return jsonify({"loading": True, "message": "Portfolio se nacita..."})
     if portfolio_cache["error"]:
         return jsonify({"error": portfolio_cache["error"]})
+    # Data exists — check staleness and self-heal in background if too old
+    if portfolio_cache["updated_at"]:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(portfolio_cache["updated_at"])
+        if age > timedelta(hours=2):
+            threading.Thread(target=refresh_portfolio, daemon=True).start()
     return jsonify({
         **(portfolio_cache["data"] or {}),
         "updated_at": portfolio_cache["updated_at"],
@@ -1591,9 +1616,28 @@ def api_pie_details_refresh():
     return jsonify({"ok": True, "loading": True})
 
 
+def _age_str(iso_ts):
+    """Human-readable age of a timestamp for Claude to report honestly."""
+    if not iso_ts:
+        return "neznamo kdy"
+    try:
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(iso_ts)
+        mins = age.total_seconds() / 60
+        if mins < 60:
+            return f"pred {int(mins)} min"
+        hours = mins / 60
+        if hours < 48:
+            return f"pred {hours:.1f} hod"
+        return f"pred {int(hours/24)} dny"
+    except Exception:
+        return "neznamo kdy"
+
+
 def build_chat_context():
     """Build a compact summary of current dashboard data for the chat system prompt."""
     parts = []
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    parts.append(f"AKTUALNI CAS (server): {now_str}")
 
     # Crypto
     cdata = crypto_cache.get("data")
@@ -1603,9 +1647,10 @@ def build_chat_context():
             f"TV={c['tv_rec']}, signal={c['signal']}"
             for c in cdata.get("coins", [])
         ]
-        parts.append("KRYPTO SIGNALY:\n" + "\n".join(coin_lines))
+        age = _age_str(crypto_cache.get("updated_at"))
+        parts.append(f"KRYPTO SIGNALY (aktualizovano {age}):\n" + "\n".join(coin_lines))
         if cdata.get("ai_analysis"):
-            parts.append("KRYPTO AI ANALYZA (drivejsi vygenerovana):\n" + cdata["ai_analysis"])
+            parts.append("KRYPTO AI ANALYZA (drivejsi vygenerovana, stejne stari jako vyse):\n" + cdata["ai_analysis"])
 
     # US stocks
     world = stocks_cache.get("world")
@@ -1615,7 +1660,8 @@ def build_chat_context():
             f"konsenzus={s.get('rec')}, cil=${s.get('target')}"
             for s in world[:20]
         ]
-        parts.append("US AKCIE (Finnhub konsenzus):\n" + "\n".join(stock_lines))
+        age = _age_str(stocks_cache.get("world_at"))
+        parts.append(f"US AKCIE - Finnhub konsenzus (aktualizovano {age}):\n" + "\n".join(stock_lines))
 
     # Patria CZ
     patria = stocks_cache.get("patria")
@@ -1624,14 +1670,16 @@ def build_chat_context():
             f"{s['name']}: {s.get('rec')}, cena={s.get('price')}, cil={s.get('target')}"
             for s in patria["cz"][:20]
         ]
-        parts.append("CESKE AKCIE (Patria):\n" + "\n".join(cz_lines))
+        age = _age_str(stocks_cache.get("patria_at"))
+        parts.append(f"CESKE AKCIE - Patria (aktualizovano {age}):\n" + "\n".join(cz_lines))
 
     # Portfolio
     pdata = portfolio_cache.get("data")
     if pdata:
+        age = _age_str(portfolio_cache.get("updated_at"))
         summ = pdata.get("summary") or {}
         parts.append(
-            f"MOJE PORTFOLIO (Trading 212): celkova hodnota {summ.get('total_value')} "
+            f"MOJE PORTFOLIO Trading 212 (aktualizovano {age}): celkova hodnota {summ.get('total_value')} "
             f"{summ.get('currency','')}, investovano {summ.get('total_invested')}, "
             f"P&L {summ.get('unrealized_pnl')}"
         )
@@ -1641,19 +1689,20 @@ def build_chat_context():
             f"cil=${p.get('target')}, potencial={p.get('potential')}%"
             for p in pdata.get("positions", [])[:40]
         ]
-        parts.append("MOJE POZICE:\n" + "\n".join(pos_lines))
+        parts.append(f"MOJE POZICE (aktualizovano {age}):\n" + "\n".join(pos_lines))
         pie_lines = [
             f"{p['name']}: hodnota {p['value']} {p.get('currency','')}, P&L {p['pnl_pct']:+.1f}%"
             for p in pdata.get("pies", [])
         ]
         if pie_lines:
-            parts.append("MOJE KOLACE:\n" + "\n".join(pie_lines))
+            parts.append(f"MOJE KOLACE (aktualizovano {age}):\n" + "\n".join(pie_lines))
         if pdata.get("ai_analysis"):
-            parts.append("PORTFOLIO AI ANALYZA (drivejsi vygenerovana):\n" + pdata["ai_analysis"])
+            parts.append("PORTFOLIO AI ANALYZA (drivejsi vygenerovana, stejne stari jako vyse):\n" + pdata["ai_analysis"])
 
     # Pie instrument-level breakdown (if available)
     pie_details = pie_detail_cache.get("data")
     if pie_details:
+        pd_age = _age_str(pie_detail_cache.get("updated_at"))
         pd_lines = []
         for pie in pie_details.get("pies", []):
             pd_lines.append(f"\n{pie['name']}:")
@@ -1663,9 +1712,9 @@ def build_chat_context():
                     f"P&L {ins['pnl_pct']:+.1f}%, konsenzus={ins['rec']}"
                 )
         if pd_lines:
-            parts.append("ROZPAD KOLACU NA JEDNOTLIVE TITULY:\n" + "\n".join(pd_lines))
+            parts.append(f"ROZPAD KOLACU NA JEDNOTLIVE TITULY (aktualizovano {pd_age}):\n" + "\n".join(pd_lines))
         if pie_details.get("ai_rebalance"):
-            parts.append("DOPORUCENI K REBALANCINGU KOLACU (drivejsi vygenerovane):\n" + pie_details["ai_rebalance"])
+            parts.append("DOPORUCENI K REBALANCINGU KOLACU (drivejsi vygenerovane, stejne stari jako vyse):\n" + pie_details["ai_rebalance"])
 
     return "\n\n".join(parts) if parts else "Zadna data zatim nejsou nactena v dashboardu."
 
@@ -1712,6 +1761,11 @@ def api_chat():
         "znamena to jen ze se jeste nenacetla nebo prave probiha nacitani na pozadi — "
         "rekni uzivateli aby otevrel danou zalozku v dashboardu (napr. 'Moje portfolio (T212)') "
         "a pockal, nez se data nactou, pripadne zkusil dotaz znovu za chvili. "
+        "KAZDA sekce dat nize ma u sebe uvedeno 'aktualizovano pred X' — to je jedina "
+        "informace o stari dat, kterou mas. NIKDY nevymyslej konkretni data, mesice ci roky "
+        "(napr. 'leden 2025') pokud je uzivatel primo neuvedl nebo pokud to neni v datech napsano. "
+        "Pokud se uzivatel zepta na stari nebo aktualnost dat, cti presne udaj 'aktualizovano pred X' "
+        "u prislusne sekce a nic si k tomu nedomyslej. "
         "Uzivatel se muze ptat na konkretni tituly, chtit vysvetlit drivejsi doporuceni, "
         "nebo porovnavat moznosti. Odpovidej cesky, konkretne a strucne.\n\n"
         "AKTUALNI DATA Z DASHBOARDU:\n" + context
