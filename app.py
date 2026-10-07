@@ -5,6 +5,7 @@ import time
 import threading
 import unicodedata
 import requests
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
@@ -446,6 +447,7 @@ PATRIA_NEWS_COUNT = int(os.environ.get("PATRIA_NEWS_COUNT", "7"))
 # Levnější model stačí na vytažení strukturovaných dat z textu; jde přepsat proměnnou PATRIA_NEWS_MODEL
 PATRIA_NEWS_MODEL = os.environ.get("PATRIA_NEWS_MODEL", "claude-haiku-4-5-20251001")
 PATRIA_NEWS_TTL = timedelta(hours=4)
+COMPOSIO_TIMEOUT = int(os.environ.get("COMPOSIO_TIMEOUT", "60"))  # s, kdyby Composio viselo
 PATRIA_NEWS_RETRY = timedelta(minutes=10)
 
 patria_news_cache = {
@@ -453,6 +455,17 @@ patria_news_cache = {
     "updating": False, "error": None, "summaries": {},
 }
 patria_news_lock = threading.Lock()
+
+
+def _news_busy():
+    """True, jen když obnova opravdu běží (příznak starší než 5 minut se bere jako zaseknutý)."""
+    c = patria_news_cache
+    if not c["updating"]:
+        return False
+    st = c.get("started_at")
+    if st and datetime.now(timezone.utc) - datetime.fromisoformat(st) > timedelta(minutes=5):
+        return False
+    return True
 
 
 def _composio_unwrap(res):
@@ -465,9 +478,21 @@ def _composio_unwrap(res):
 
 
 def composio_execute(slug, arguments):
-    """Spustí Composio nástroj. Nejdřív oficiální Python SDK, při selhání REST API v3."""
+    """Spustí Composio nástroj s časovým limitem, aby se obnova nikdy nezasekla."""
     if not COMPOSIO_API_KEY:
         raise RuntimeError("Chybí proměnná COMPOSIO_API_KEY")
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(_composio_execute_inner, slug, arguments)
+    try:
+        return fut.result(timeout=COMPOSIO_TIMEOUT)
+    except FuturesTimeout:
+        raise RuntimeError(f"Composio neodpovědělo do {COMPOSIO_TIMEOUT} s, zkus Obnovit znovu")
+    finally:
+        ex.shutdown(wait=False)
+
+
+def _composio_execute_inner(slug, arguments):
+    """Oficiální Python SDK, při selhání REST API v3."""
     errors = []
     res = None
     try:
@@ -498,7 +523,14 @@ def composio_execute(slug, arguments):
         except Exception as e:
             errors.append(f"REST: {e}")
     if res is None:
-        raise RuntimeError("Composio selhalo — " + " | ".join(errors))
+        msg = " | ".join(errors)
+        if "401" in msg or "Invalid API key" in msg:
+            raise RuntimeError(
+                "Composio odmítlo API klíč (401). Do proměnné COMPOSIO_API_KEY na Renderu vlož platný "
+                "API klíč projektu z Composio (Settings → API Keys) a ověř, že v tom samém projektu je "
+                "připojený osobní Gmail."
+            )
+        raise RuntimeError("Composio selhalo — " + msg[:400])
     return _composio_unwrap(res)
 
 
@@ -646,9 +678,10 @@ def summarize_newsletter(item):
 def refresh_patria_news():
     c = patria_news_cache
     with patria_news_lock:
-        if c["updating"]:
+        if _news_busy():
             return
         c["updating"] = True
+        c["started_at"] = datetime.now(timezone.utc).isoformat()
     c["error"] = None
     try:
         msgs = fetch_patria_newsletters()
@@ -680,7 +713,7 @@ def refresh_patria_news():
 def maybe_refresh_patria_news(force=False):
     """Spustí obnovu na pozadí, pokud jsou data stará. Vrací True, když se obnova spustila."""
     c = patria_news_cache
-    if c["updating"] or not COMPOSIO_API_KEY:
+    if _news_busy() or not COMPOSIO_API_KEY:
         return False
     now = datetime.now(timezone.utc)
     if not force:
@@ -1909,7 +1942,7 @@ def api_patria_news():
         "configured": bool(COMPOSIO_API_KEY),
         "items": items,
         "updated_at": c["updated_at"],
-        "updating": bool(c["updating"] or started),
+        "updating": bool(_news_busy() or started),
         "error": c["error"],
         "portfolio_known": portfolio_known,
     })
