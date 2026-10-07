@@ -7,4 +7,10 @@ services:
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
+      - key: COMPOSIO_API_KEY
+        sync: false
+      - key: COMPOSIO_USER_ID
+        sync: false
+      - key: COMPOSIO_GMAIL_ACCOUNT_ID
+        sync: false
     plan: free
