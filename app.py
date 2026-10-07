@@ -434,12 +434,17 @@ def refresh_stocks():
 
 COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
 COMPOSIO_USER_ID = os.environ.get("COMPOSIO_USER_ID", "")
-COMPOSIO_GMAIL_ACCOUNT_ID = os.environ.get("COMPOSIO_GMAIL_ACCOUNT_ID", "")
+COMPOSIO_GMAIL_ACCOUNT_ID = (
+    os.environ.get("COMPOSIO_GMAIL_ACCOUNT_ID")
+    or os.environ.get("COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID", "")
+)
 PATRIA_NEWS_QUERY = os.environ.get(
     "PATRIA_NEWS_QUERY",
-    "from:(c.c@patria.cz OR research@investovani.patria.cz) newer_than:30d",
+    "from:(c.c@patria.cz OR research@investovani.patria.cz) newer_than:8d",
 )
-PATRIA_NEWS_COUNT = int(os.environ.get("PATRIA_NEWS_COUNT", "10"))
+PATRIA_NEWS_COUNT = int(os.environ.get("PATRIA_NEWS_COUNT", "7"))
+# Levnější model stačí na vytažení strukturovaných dat z textu; jde přepsat proměnnou PATRIA_NEWS_MODEL
+PATRIA_NEWS_MODEL = os.environ.get("PATRIA_NEWS_MODEL", "claude-haiku-4-5-20251001")
 PATRIA_NEWS_TTL = timedelta(hours=4)
 PATRIA_NEWS_RETRY = timedelta(minutes=10)
 
@@ -621,7 +626,7 @@ def summarize_newsletter(item):
             "content-type": "application/json",
         },
         json={
-            "model": "claude-sonnet-4-5",
+            "model": PATRIA_NEWS_MODEL,
             "max_tokens": 1800,
             "system": PATRIA_NEWS_SYSTEM,
             "messages": [{

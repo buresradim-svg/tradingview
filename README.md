@@ -24,9 +24,10 @@ Viz instrukce níže v README nebo follow steps z Claude.
 | `PORT` | Port (Render nastaví automaticky) |
 | `COMPOSIO_API_KEY` | Composio API klíč (čtení newsletterů Patria z Gmailu) |
 | `COMPOSIO_USER_ID` | Volitelné: user/entity ID v Composio, pod kterým je Gmail připojený |
-| `COMPOSIO_GMAIL_ACCOUNT_ID` | Volitelné: ID připojeného Gmail účtu v Composio (osobní Gmail s newslettery) |
-| `PATRIA_NEWS_QUERY` | Volitelné: Gmail dotaz na newslettery (výchozí: odesílatelé c.c@patria.cz a research@investovani.patria.cz, posledních 30 dní) |
-| `PATRIA_NEWS_COUNT` | Volitelné: kolik posledních e-mailů zpracovat (výchozí 10) |
+| `COMPOSIO_GMAIL_ACCOUNT_ID` | Volitelné: ID připojeného Gmail účtu v Composio (osobní Gmail s newslettery). Funguje i pod názvem `COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID` |
+| `PATRIA_NEWS_MODEL` | Volitelné: model pro shrnutí newsletterů (výchozí `claude-haiku-4-5-20251001`, levnější než Sonnet) |
+| `PATRIA_NEWS_QUERY` | Volitelné: Gmail dotaz na newslettery (výchozí: odesílatelé c.c@patria.cz a research@investovani.patria.cz, posledních 8 dní) |
+| `PATRIA_NEWS_COUNT` | Volitelné: kolik posledních e-mailů zpracovat (výchozí 7) |
 
 ## Newslettery Patria v záložce Akcie CZ
 
