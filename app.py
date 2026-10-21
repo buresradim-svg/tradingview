@@ -1047,7 +1047,14 @@ tr:last-child td{border-bottom:none}
   <div id="tab-portfolio" class="tab-content">
     <div class="hdr">
       <div class="hdr-l">Moje portfolio — Trading 212 <span class="sm" id="t212-meta"></span></div>
-      <button class="btn" onclick="forceRefreshPortfolio()">Obnovit ↻</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" id="export-btn" onclick="exportForClaude()">Kopírovat data pro Claude</button>
+        <button class="btn" onclick="forceRefreshPortfolio()">Obnovit ↻</button>
+      </div>
+    </div>
+    <div id="export-fallback" style="display:none;margin-bottom:14px">
+      <div class="info">Automatické kopírování prohlížeč nepovolil. Text je níže označený — zkopíruj ho Cmd+C.</div>
+      <textarea id="export-text" readonly style="width:100%;height:220px;font-family:monospace;font-size:12px;background:var(--card);color:var(--text);border:0.5px solid var(--border);border-radius:8px;padding:10px"></textarea>
     </div>
     <div id="perr"></div>
     <div id="p-no-key" style="display:none" class="info">
@@ -1076,9 +1083,9 @@ tr:last-child td{border-bottom:none}
       <div class="ai-box" id="p-ai" style="color:var(--muted);font-style:italic"><span class="sp"></span>Připravuji analýzu...</div>
 
       <div class="sec" style="margin-top:16px">Rozpad koláčů na jednotlivé tituly</div>
-      <div class="info">Zobrazí každý titul uvnitř koláčů — aktuální vs. cílový podíl, výkonnost a doporučení analytiků. Kvůli limitům Trading 212 API trvá analýza cca 5 minut.</div>
+      <div class="info">Zobrazí každý titul uvnitř koláčů — aktuální vs. cílový podíl, výkonnost a doporučení analytiků. Kvůli limitům Trading 212 API trvá analýza cca 2 minuty.</div>
       <div id="pie-detail-idle">
-        <button class="btn" onclick="startPieAnalysis()">Analyzovat složení koláčů (~5 min)</button>
+        <button class="btn" onclick="startPieAnalysis()">Analyzovat složení koláčů (~2 min)</button>
       </div>
       <div id="pie-detail-progress" style="display:none" class="info">
         <span class="sp"></span><span id="pie-progress-text">Analyzuji...</span>
@@ -1198,6 +1205,61 @@ setInterval(loadCrypto,60*60*1000);
 // ── Portfolio ────────────────────────────────────────────────────────────────
 function fmtVal(n){if(!n&&n!==0)return'—';if(Math.abs(n)>=1000)return n.toLocaleString('cs-CZ',{maximumFractionDigits:0,style:'currency',currency:'USD'});return'$'+n.toFixed(2)}
 let portDone=false;
+async function fetchExportText(){
+  const d=await fetch('/api/portfolio/export').then(r=>r.json());
+  if(d.error)throw new Error(d.error);
+  return d.text;
+}
+function showExportFallback(text){
+  const box=document.getElementById('export-fallback');
+  const ta=document.getElementById('export-text');
+  ta.value=text;
+  box.style.display='block';
+  ta.focus();ta.select();
+}
+function flashExportBtn(label){
+  const btn=document.getElementById('export-btn');
+  btn.textContent=label;
+  setTimeout(()=>{btn.textContent='Kopírovat data pro Claude';btn.disabled=false;},2500);
+}
+async function exportForClaude(){
+  const btn=document.getElementById('export-btn');
+  btn.disabled=true;btn.textContent='Připravuji...';
+  document.getElementById('export-fallback').style.display='none';
+  // Safari requires the clipboard write to start inside the click, so hand it a promise
+  if(window.ClipboardItem&&navigator.clipboard&&navigator.clipboard.write){
+    let textForFallback=null;
+    const textPromise=fetchExportText().then(t=>{textForFallback=t;return new Blob([t],{type:'text/plain'});});
+    try{
+      await navigator.clipboard.write([new ClipboardItem({'text/plain':textPromise})]);
+      flashExportBtn('Zkopírováno ✓');
+      return;
+    }catch(e){
+      try{
+        const t=textForFallback||await fetchExportText();
+        showExportFallback(t);
+        flashExportBtn('Zkopíruj ručně ↓');
+      }catch(err){
+        document.getElementById('perr').innerHTML=`<div class="err">${err.message}</div>`;
+        flashExportBtn('Chyba');
+      }
+      return;
+    }
+  }
+  try{
+    const t=await fetchExportText();
+    try{
+      await navigator.clipboard.writeText(t);
+      flashExportBtn('Zkopírováno ✓');
+    }catch(e){
+      showExportFallback(t);
+      flashExportBtn('Zkopíruj ručně ↓');
+    }
+  }catch(err){
+    document.getElementById('perr').innerHTML=`<div class="err">${err.message}</div>`;
+    flashExportBtn('Chyba');
+  }
+}
 async function forceRefreshPortfolio(){
   try{
     await fetch('/api/portfolio/refresh',{method:'POST'});
@@ -1322,7 +1384,7 @@ async function checkPieDetails(){
     }
     if(d.loading){
       const prog=d.progress||{done:0,total:0};
-      document.getElementById('pie-progress-text').textContent=`Analyzuji koláč ${prog.done}/${prog.total}... (cca 30s na koláč)`;
+      document.getElementById('pie-progress-text').textContent=`Analyzuji koláč ${prog.done}/${prog.total}... (cca 12 s na koláč)`;
       return;
     }
     if(d.error){
@@ -1622,6 +1684,95 @@ def api_portfolio_refresh():
     return jsonify({"ok": True, "loading": True})
 
 
+def build_portfolio_export():
+    """Plain-text snapshot of the T212 tab, meant to be pasted into the Claude app."""
+    pdata = portfolio_cache.get("data")
+    if not pdata:
+        return None
+
+    def fmt(n):
+        try:
+            return f"{float(n):,.0f}".replace(",", " ")
+        except Exception:
+            return "—"
+
+    now_local = datetime.now(timezone(timedelta(hours=2))).strftime("%d.%m.%Y %H:%M")
+    summ = pdata.get("summary") or {}
+    cur = summ.get("currency", "")
+    lines = []
+    lines.append("# Moje investiční portfolio — Trading 212")
+    lines.append(f"Export z dashboardu: {now_local}")
+    lines.append(f"Data portfolia aktualizována: {_age_str(portfolio_cache.get('updated_at'))}")
+    lines.append("")
+    lines.append("## Souhrn účtu")
+    lines.append(f"- Celková hodnota: {fmt(summ.get('total_value'))} {cur}")
+    lines.append(f"- Investováno (nákupní cena): {fmt(summ.get('total_invested'))} {cur}")
+    lines.append(f"- Nerealizovaný zisk/ztráta: {fmt(summ.get('unrealized_pnl'))} {cur}")
+    lines.append(f"- Volná hotovost: {fmt(summ.get('cash_free'))} {cur}")
+    lines.append("")
+
+    pies = pdata.get("pies") or []
+    if pies:
+        lines.append(f"## Koláče (pies) — hodnoty v {cur}")
+        lines.append("| Koláč | Hodnota | Investováno | P&L % | Dividendy |")
+        lines.append("|---|---|---|---|---|")
+        for p in sorted(pies, key=lambda x: x.get("value") or 0, reverse=True):
+            lines.append(
+                f"| {p['name']} | {fmt(p.get('value'))} | {fmt(p.get('invested'))} | "
+                f"{p.get('pnl_pct', 0):+.1f} % | {fmt(p.get('dividends'))} |"
+            )
+        lines.append("")
+
+    pie_details = pie_detail_cache.get("data")
+    if pie_details and pie_details.get("pies"):
+        lines.append(f"## Složení koláčů (aktualizováno {_age_str(pie_detail_cache.get('updated_at'))})")
+        for pie in pie_details["pies"]:
+            ins_list = pie.get("instruments") or []
+            if not ins_list:
+                continue
+            lines.append(f"### {pie['name']}")
+            lines.append("| Ticker | Název | Podíl | Cílový podíl | Hodnota | P&L % | Konsenzus analytiků | Cílová cena $ |")
+            lines.append("|---|---|---|---|---|---|---|---|")
+            for ins in ins_list:
+                tgt = f"{ins['target']:.2f}" if ins.get("target") else "—"
+                lines.append(
+                    f"| {ins['sym']} | {ins.get('name', '')} | {ins['current_share']} % | "
+                    f"{ins['expected_share']} % | {fmt(ins.get('value'))} | {ins['pnl_pct']:+.1f} % | "
+                    f"{ins.get('rec', 'N/A')} | {tgt} |"
+                )
+            lines.append("")
+    else:
+        lines.append("## Složení koláčů")
+        lines.append("(Nenačteno — v dashboardu nebyla spuštěna analýza složení koláčů.)")
+        lines.append("")
+
+    positions = pdata.get("positions") or []
+    if positions:
+        lines.append(f"## Volné pozice (mimo koláče) — P&L v {cur}, ceny v USD")
+        lines.append("| Ticker | Název | Ks | Prům. nákup $ | Aktuální cena $ | Hodnota | P&L | P&L % | Konsenzus | Cílová cena $ | Potenciál % |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        for p in positions:
+            tgt = f"{p['target']:.2f}" if p.get("target") else "—"
+            pot = f"{p['potential']:+.1f}" if p.get("potential") is not None else "—"
+            lines.append(
+                f"| {p['sym']} | {p.get('name', '')} | {p.get('quantity')} | {p.get('avg_price')} | "
+                f"{p.get('current_price')} | {fmt(p.get('current_val'))} | {fmt(p.get('pnl'))} | "
+                f"{p.get('pnl_pct', 0):+.1f} | {p.get('rec', 'N/A')} | {tgt} | {pot} |"
+            )
+        lines.append("")
+
+    lines.append("Zdroje: Trading 212 API (pozice, koláče, hodnoty), Finnhub (konsenzus a cílové ceny analytiků).")
+    return "\n".join(lines)
+
+
+@app.route("/api/portfolio/export")
+def api_portfolio_export():
+    text = build_portfolio_export()
+    if text is None:
+        return jsonify({"error": "Portfolio ještě není načtené — otevři záložku Moje portfolio a počkej na data."})
+    return jsonify({"text": text})
+
+
 @app.route("/api/pie-details")
 def api_pie_details():
     if not T212_KEY:
@@ -1651,18 +1802,20 @@ def api_pie_details_refresh():
 def _age_str(iso_ts):
     """Human-readable age of a timestamp for Claude to report honestly."""
     if not iso_ts:
-        return "neznamo kdy"
+        return "neznámo kdy"
     try:
         age = datetime.now(timezone.utc) - datetime.fromisoformat(iso_ts)
         mins = age.total_seconds() / 60
+        if mins < 2:
+            return "právě teď"
         if mins < 60:
-            return f"pred {int(mins)} min"
+            return f"před {int(mins)} min"
         hours = mins / 60
         if hours < 48:
-            return f"pred {hours:.1f} hod"
-        return f"pred {int(hours/24)} dny"
+            return f"před {hours:.1f} hod"
+        return f"před {int(hours/24)} dny"
     except Exception:
-        return "neznamo kdy"
+        return "neznámo kdy"
 
 
 def build_chat_context():
