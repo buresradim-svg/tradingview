@@ -1,9 +1,6 @@
 import os
 import re
-import json
 import time
-import threading
-import unicodedata
 import requests
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
@@ -426,306 +423,6 @@ def refresh_stocks():
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# PATRIA NEWSLETTERY (Gmail přes Composio) + shrnutí od Claude
-# ════════════════════════════════════════════════════════════════════════════
-# Newslettery chodí do osobního Gmailu. Server je při otevření záložky (max. 1× za
-# PATRIA_NEWS_TTL) stáhne přes Composio, nechá Claude vytáhnout akciové nápady
-# a výsledek drží v paměti. Nic se neposílá e-mailem.
-
-COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY", "")
-COMPOSIO_USER_ID = os.environ.get("COMPOSIO_USER_ID", "")
-COMPOSIO_GMAIL_ACCOUNT_ID = (
-    os.environ.get("COMPOSIO_GMAIL_ACCOUNT_ID")
-    or os.environ.get("COMPOSIO_GMAIL_PERSONAL_ACCOUNT_ID", "")
-)
-PATRIA_NEWS_QUERY = os.environ.get(
-    "PATRIA_NEWS_QUERY",
-    "from:(c.c@patria.cz OR research@investovani.patria.cz) newer_than:8d",
-)
-PATRIA_NEWS_COUNT = int(os.environ.get("PATRIA_NEWS_COUNT", "7"))
-# Levnější model stačí na vytažení strukturovaných dat z textu; jde přepsat proměnnou PATRIA_NEWS_MODEL
-PATRIA_NEWS_MODEL = os.environ.get("PATRIA_NEWS_MODEL", "claude-haiku-4-5-20251001")
-PATRIA_NEWS_TTL = timedelta(hours=4)
-PATRIA_NEWS_RETRY = timedelta(minutes=10)
-
-patria_news_cache = {
-    "items": [], "updated_at": None, "attempted_at": None,
-    "updating": False, "error": None, "summaries": {},
-}
-patria_news_lock = threading.Lock()
-
-
-def _composio_unwrap(res):
-    if not isinstance(res, dict):
-        raise RuntimeError(f"Neočekávaná odpověď Composio ({type(res).__name__})")
-    if res.get("successful") is False or res.get("error"):
-        raise RuntimeError(f"Composio: {res.get('error') or 'nástroj selhal'}")
-    data = res.get("data") or {}
-    return data.get("response_data") or data
-
-
-def composio_execute(slug, arguments):
-    """Spustí Composio nástroj. Nejdřív oficiální Python SDK, při selhání REST API v3."""
-    if not COMPOSIO_API_KEY:
-        raise RuntimeError("Chybí proměnná COMPOSIO_API_KEY")
-    errors = []
-    res = None
-    try:
-        from composio import Composio
-        client = Composio(api_key=COMPOSIO_API_KEY)
-        kwargs = {"dangerously_skip_version_check": True}
-        if COMPOSIO_USER_ID:
-            kwargs["user_id"] = COMPOSIO_USER_ID
-        if COMPOSIO_GMAIL_ACCOUNT_ID:
-            kwargs["connected_account_id"] = COMPOSIO_GMAIL_ACCOUNT_ID
-        res = client.tools.execute(slug, arguments, **kwargs)
-    except Exception as e:
-        errors.append(f"SDK: {e}")
-    if res is None:
-        try:
-            body = {"arguments": arguments}
-            if COMPOSIO_USER_ID:
-                body["user_id"] = COMPOSIO_USER_ID
-            if COMPOSIO_GMAIL_ACCOUNT_ID:
-                body["connected_account_id"] = COMPOSIO_GMAIL_ACCOUNT_ID
-            r = requests.post(
-                f"https://backend.composio.dev/api/v3/tools/execute/{slug}",
-                headers={"x-api-key": COMPOSIO_API_KEY, "content-type": "application/json"},
-                json=body, timeout=40,
-            )
-            r.raise_for_status()
-            res = r.json()
-        except Exception as e:
-            errors.append(f"REST: {e}")
-    if res is None:
-        raise RuntimeError("Composio selhalo — " + " | ".join(errors))
-    return _composio_unwrap(res)
-
-
-def _clean_mail_body(text):
-    """Odstraní trackovací odkazy a přebytečné prázdné řádky z těla e-mailu."""
-    t = re.sub(r"\[?https?://[^\s\]]+\]?", "", text or "")
-    t = t.replace("\r", "")
-    t = re.sub(r"[​-‏͏﻿\xa0]+", " ", t)
-    t = re.sub(r"[ \t]+\n", "\n", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    # právní upozornění na konci nemá pro shrnutí smysl
-    cut = t.find("Tento dokument byl vytvořen analytickým oddělením")
-    if cut > 500:
-        t = t[:cut]
-    return t.strip()
-
-
-def fetch_patria_newsletters():
-    data = composio_execute("GMAIL_FETCH_EMAILS", {
-        "query": PATRIA_NEWS_QUERY,
-        "max_results": PATRIA_NEWS_COUNT,
-        "verbose": True,
-        "include_payload": True,
-    })
-    out = []
-    for m in data.get("messages") or []:
-        mid = m.get("messageId")
-        if not mid:
-            continue
-        sender = m.get("sender") or ""
-        out.append({
-            "id": mid,
-            "subject": m.get("subject") or "(bez předmětu)",
-            "sender": sender,
-            "date": m.get("messageTimestamp") or "",
-            "url": m.get("display_url") or "",
-            "kind": "weekly" if "research@investovani" in sender.lower() else "daily",
-            "body": _clean_mail_body(m.get("messageText") or "")[:14000],
-        })
-    out.sort(key=lambda x: x["date"], reverse=True)
-    return out
-
-
-PATRIA_NEWS_SYSTEM = (
-    "Jsi investiční analytik, který pro českého soukromého investora zpracovává newslettery "
-    "Patria Finance. Pracuješ POUZE s textem newsletteru. Nic si nedomýšlíš a nedoplňuješ z paměti "
-    "(žádné ceny, cílové ceny ani tickery, které v textu nejsou).\n\n"
-    "Odpověz VÝHRADNĚ jedním JSON objektem (bez markdownu a bez komentáře) v tomto tvaru:\n"
-    '{"overview": "2-3 věty: co se na trzích děje",\n'
-    ' "ideas": [{"name": "název společnosti", "ticker": "ticker nebo prázdný řetězec", '
-    '"market": "CZ|US|EU|jiné", "kind": "doporučení|zpráva", "action": "koupit|držet|prodat|sledovat", '
-    '"patria_list": "Investiční tipy|Watchlist|", '
-    '"source": "kdo to říká, např. JPMorgan, Patria analytik, nebo newsletter", '
-    '"reason": "1-2 věty proč", "target": "cílová cena s měnou, jen pokud je v textu, jinak prázdný řetězec"}],\n'
-    ' "events": ["důležité události a data v nejbližších dnech"],\n'
-    ' "risks": ["hlavní rizika nebo varování"]}\n\n'
-    "Pravidla:\n"
-    "- Do ideas dávej jen konkrétní akcie nebo tituly, ne indexy, měny, komodity ani dluhopisy. Max 8, od nejdůležitějšího.\n"
-    "- kind='doporučení' POUZE když text výslovně uvádí doporučení nebo cílovou cenu analytika či banky "
-    "k danému titulu; action pak odpovídá doporučení (koupit/držet/prodat).\n"
-    "- Patria u názvů společností v závorce uvádí seznam, kam patří: (Investiční tipy) nebo (Watchlist). "
-    "Pokud je u titulu takový údaj, vyplň patria_list přesně touto hodnotou. Jinak patria_list nech prázdné.\n"
-    "- Titul zmíněný jen ve zprávě (výsledky, IPO, převzetí, pohyb ceny) má kind='zpráva' a action='sledovat'.\n"
-    "- Když newsletter žádné konkrétní tituly neobsahuje, vrať prázdné pole ideas. Nevymýšlej.\n"
-    "- Piš česky, stručně, věcně."
-)
-
-_NEWS_ACTIONS = {"koupit", "držet", "prodat", "sledovat"}
-_NEWS_LISTS = {"investiční tipy": "Investiční tipy", "watchlist": "Watchlist"}
-
-
-def _parse_json_block(text):
-    t = (text or "").strip()
-    if t.startswith("```"):
-        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t)
-    start, end = t.find("{"), t.rfind("}")
-    if start == -1 or end <= start:
-        raise ValueError("Claude nevrátil JSON")
-    return json.loads(t[start:end + 1])
-
-
-def _clean_summary(s):
-    def txt(v, n):
-        return str(v if v is not None else "").strip()[:n]
-
-    ideas = []
-    for i in (s.get("ideas") or [])[:8]:
-        if not isinstance(i, dict) or not txt(i.get("name"), 80):
-            continue
-        kind = txt(i.get("kind"), 20).lower()
-        action = txt(i.get("action"), 20).lower()
-        if kind != "doporučení":
-            kind = "zpráva"
-        if kind == "zpráva" or action not in _NEWS_ACTIONS:
-            action = "sledovat"
-        ideas.append({
-            "name": txt(i.get("name"), 80),
-            "ticker": txt(i.get("ticker"), 12).upper(),
-            "market": txt(i.get("market"), 10),
-            "kind": kind,
-            "action": action,
-            "patria_list": _NEWS_LISTS.get(txt(i.get("patria_list"), 30).lower(), ""),
-            "source": txt(i.get("source"), 80),
-            "reason": txt(i.get("reason"), 400),
-            "target": txt(i.get("target"), 40),
-        })
-    return {
-        "overview": txt(s.get("overview"), 900),
-        "ideas": ideas,
-        "events": [txt(x, 260) for x in (s.get("events") or []) if x][:6],
-        "risks": [txt(x, 260) for x in (s.get("risks") or []) if x][:5],
-    }
-
-
-def summarize_newsletter(item):
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("Chybí ANTHROPIC_API_KEY")
-    if len(item["body"]) < 120:
-        raise RuntimeError("E-mail nemá čitelný text (jen obrázky nebo HTML), nelze shrnout.")
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": PATRIA_NEWS_MODEL,
-            "max_tokens": 1800,
-            "system": PATRIA_NEWS_SYSTEM,
-            "messages": [{
-                "role": "user",
-                "content": (
-                    f"Předmět: {item['subject']}\nDatum: {item['date']}\n\n"
-                    f"TEXT NEWSLETTERU:\n{item['body']}"
-                ),
-            }],
-        },
-        timeout=60,
-    )
-    r.raise_for_status()
-    return _clean_summary(_parse_json_block(r.json()["content"][0]["text"]))
-
-
-def refresh_patria_news():
-    c = patria_news_cache
-    with patria_news_lock:
-        if c["updating"]:
-            return
-        c["updating"] = True
-    c["error"] = None
-    try:
-        msgs = fetch_patria_newsletters()
-        items = []
-        for m in msgs:
-            items.append({
-                "id": m["id"], "subject": m["subject"], "sender": m["sender"],
-                "date": m["date"], "url": m["url"], "kind": m["kind"],
-                "summary": c["summaries"].get(m["id"]), "summary_error": "",
-            })
-        c["items"] = items  # hned zobrazit seznam, shrnutí doplňujeme postupně
-        c["updated_at"] = datetime.now(timezone.utc).isoformat()
-        bodies = {m["id"]: m for m in msgs}
-        for it in items:
-            if it["summary"] is not None:
-                continue
-            try:
-                it["summary"] = summarize_newsletter(bodies[it["id"]])
-                c["summaries"][it["id"]] = it["summary"]
-            except Exception as e:
-                it["summary_error"] = f"Shrnutí se nepodařilo: {e}"[:300]
-    except Exception as e:
-        c["error"] = str(e)
-    finally:
-        c["attempted_at"] = datetime.now(timezone.utc).isoformat()
-        c["updating"] = False
-
-
-def maybe_refresh_patria_news(force=False):
-    """Spustí obnovu na pozadí, pokud jsou data stará. Vrací True, když se obnova spustila."""
-    c = patria_news_cache
-    if c["updating"] or not COMPOSIO_API_KEY:
-        return False
-    now = datetime.now(timezone.utc)
-    if not force:
-        att = c.get("attempted_at")
-        if att and (c["error"] or not c["items"]) and now - datetime.fromisoformat(att) < PATRIA_NEWS_RETRY:
-            return False  # po chybě nezkoušet pořád dokola
-        upd = c.get("updated_at")
-        if upd and now - datetime.fromisoformat(upd) < PATRIA_NEWS_TTL:
-            return False
-    threading.Thread(target=refresh_patria_news, daemon=True).start()
-    return True
-
-
-def _norm_name(s):
-    s = unicodedata.normalize("NFKD", (s or "").lower()).encode("ascii", "ignore").decode()
-    return re.sub(r"[^a-z0-9]+", " ", s).strip()
-
-
-def annotate_held(items):
-    """Ke každému nápadu přidá held=True/False podle pozic v T212 (None, pokud portfolio ještě není načtené)."""
-    positions = (portfolio_cache.get("data") or {}).get("positions") or []
-    known = bool(positions)
-    syms = {str(p.get("sym", "")).upper() for p in positions if p.get("sym")}
-    names = [_norm_name(str(p.get("name", ""))) for p in positions if p.get("name")]
-    out = []
-    for it in items:
-        summ = it.get("summary")
-        if not summ:
-            out.append(it)
-            continue
-        ideas = []
-        for idea in summ.get("ideas", []):
-            held = None
-            if known:
-                n = _norm_name(idea.get("name", ""))
-                held = bool(
-                    (idea.get("ticker") and idea["ticker"].upper() in syms) or
-                    (len(n) >= 5 and any(f" {n} " in f" {pn} " or f" {pn} " in f" {n} " for pn in names if len(pn) >= 5))
-                )
-            ideas.append({**idea, "held": held})
-        out.append({**it, "summary": {**summ, "ideas": ideas}})
-    return out, known
-
-
-# ════════════════════════════════════════════════════════════════════════════
 # HTML DASHBOARD
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -1126,8 +823,8 @@ def ask_claude_pie_rebalance(pies_breakdown):
 
 
 def refresh_pie_details():
-    """Fetch instrument-level breakdown for every pie. Respects T212's 1 req/30s rate limit
-    on the pie detail endpoint, so this takes several minutes for multiple pies."""
+    """Fetch instrument-level breakdown for every pie. Respects T212's rate limit
+    on the pie detail endpoint, so this takes a few minutes for multiple pies."""
     if pie_detail_cache["updating"]:
         return
     pie_detail_cache["updating"] = True
@@ -1148,7 +845,19 @@ def refresh_pie_details():
 
         for i, pie_id in enumerate(pie_ids):
             try:
-                detail = t212_get(f"/equity/pies/{pie_id}")
+                # Retry on rate limit instead of always waiting the worst case
+                detail = None
+                for attempt in range(4):
+                    try:
+                        detail = t212_get(f"/equity/pies/{pie_id}")
+                        break
+                    except Exception as e:
+                        if "rate limit" in str(e).lower() and attempt < 3:
+                            time.sleep(12)
+                            continue
+                        raise
+                if detail is None:
+                    raise Exception("nepodarilo se nacist detail kolace")
                 instruments_raw = detail.get("instruments") or []
                 settings = detail.get("settings") or {}
                 name = T212_PIE_NAMES.get(pie_id) or settings.get("name") or f"Kolac {pie_id}"
@@ -1181,7 +890,7 @@ def refresh_pie_details():
 
             pie_detail_cache["progress"] = {"done": i + 1, "total": len(pie_ids)}
             if i < len(pie_ids) - 1:
-                time.sleep(30)  # respect T212 rate limit: 1 req / 30s
+                time.sleep(12)  # base pacing; the retry loop above handles any 429
 
         ai_rebalance = ask_claude_pie_rebalance(pies_breakdown)
 
@@ -1255,14 +964,6 @@ tr:last-child td{border-bottom:none}
 .chat-input{flex:1;resize:none;border:0.5px solid var(--border);border-radius:10px;padding:10px 12px;font-family:inherit;font-size:13px;background:var(--card);color:var(--text)}
 .chat-input:focus{outline:none;border-color:var(--blue)}
 .chat-send{padding:10px 18px;white-space:nowrap}
-.nc{background:var(--card);border:0.5px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:10px}
-.nc-t{font-size:13px;font-weight:500;line-height:1.4}
-.nc-m{font-size:11px;color:var(--muted);margin:2px 0 8px}
-.nc-o{font-size:13px;line-height:1.6;margin-bottom:8px}
-.idea{border-top:0.5px solid var(--border);padding:9px 0;font-size:13px;line-height:1.5}
-.idea-h{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:2px}
-.idea-s{font-size:12px;color:var(--muted)}
-.nc ul{margin:4px 0 0 18px;line-height:1.55}
 @media(max-width:600px){.hm{display:none}td,th{padding:7px 7px}}
 </style>
 </head>
@@ -1325,14 +1026,6 @@ tr:last-child td{border-bottom:none}
       <thead><tr><th>Akcie</th><th class="hm">Analytická firma</th><th>Doporučení</th><th class="hm">Předchozí</th><th>Cílová cena</th></tr></thead>
       <tbody id="mon-tb"><tr><td colspan="5" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
     </table></div>
-
-    <div class="hdr" style="margin-top:26px">
-      <div class="hdr-l">Newslettery Patria — shrnutí a nápady <span class="sm" id="news-meta"></span></div>
-      <button class="btn" onclick="loadNews(true)">Obnovit ↻</button>
-    </div>
-    <div class="info">Newslettery z osobního Gmailu · Claude z nich vybírá akciové tituly a drží se jen textu e-mailu · Nápady k ověření, ne pokyn k nákupu · Data se obnovují na pozadí nejvýš 1× za 4 hodiny</div>
-    <div id="news-err"></div>
-    <div id="news-box"><div style="padding:16px;color:var(--muted)"><span class="sp"></span>Načítám...</div></div>
     <p class="note">Toto není finanční poradenství.</p>
   </div>
 
@@ -1433,7 +1126,6 @@ function sw(id,btn){
   document.getElementById('tab-'+id).classList.add('active');
   btn.classList.add('active');
   if(id==='cz'||id==='us')loadStocks();
-  if(id==='cz')loadNews();
   if(id==='portfolio'){loadPortfolio();checkPieStatusOnLoad();}
   if(id==='chat'){loadPortfolio();loadStocks();}
 }
@@ -1499,79 +1191,6 @@ async function loadStocks(force){
     else usR='<tr><td colspan="7" style="text-align:center;padding:20px;color:var(--muted)">Načítám Yahoo Finance (může trvat 1–2 min)...</td></tr>';
     document.getElementById('us-tb').innerHTML=usR;
   }catch(e){document.getElementById('serr').innerHTML=`<div class="err">Chyba: ${e.message}</div>`;}
-}
-// ── Patria newslettery ───────────────────────────────────────────────────────
-function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
-function newsBadge(i){
-  if(i.kind==='doporučení')return`<span class="badge ${i.action==='koupit'?'g':i.action==='prodat'?'r':'a'}">${esc(i.action)}</span>`;
-  return'<span class="badge n">zpráva · sledovat</span>';
-}
-function newsList(i){return i.patria_list?`<span class="badge a">Patria: ${esc(i.patria_list)}</span>`:''}
-function newsAgg(items){
-  const seen={},rows=[];
-  for(const n of items){
-    if(!n.summary)continue;
-    for(const i of n.summary.ideas||[]){
-      if(i.kind!=='doporučení'&&i.patria_list!=='Investiční tipy')continue;
-      const k=(i.ticker||i.name).toLowerCase();
-      if(seen[k]){seen[k].c++;continue}
-      seen[k]={i:i,n:n,c:1};rows.push(seen[k]);
-    }
-  }
-  if(!rows.length)return'<div class="info">V posledních newsletterech není žádné konkrétní doporučení k akcii, jen zprávy a tržní komentáře.</div>';
-  const rank={koupit:0,držet:1,sledovat:2,prodat:3};
-  rows.sort((a,b)=>(rank[a.i.action]!=null?rank[a.i.action]:9)-(rank[b.i.action]!=null?rank[b.i.action]:9));
-  let h='<div class="sec">Konkrétní doporučení z newsletterů (posledních '+items.length+' e-mailů)</div><div class="tw"><table><thead><tr><th>Titul</th><th>Doporučení</th><th class="hm">Zdroj</th><th>Cíl</th><th class="hm">Kdy</th><th>V portfoliu</th></tr></thead><tbody>';
-  for(const r of rows){
-    const i=r.i,dt=r.n.date?new Date(r.n.date).toLocaleDateString('cs-CZ',{day:'numeric',month:'numeric'}):'';
-    const held=i.held===true?'<span class="badge g">ano</span>':i.held===false?'<span class="sm">ne</span>':'—';
-    h+=`<tr><td><strong>${esc(i.name)}</strong>${i.ticker?` <span class="sm">${esc(i.ticker)}</span>`:''}${r.c>1?` <span class="sm">· ${r.c}×</span>`:''}</td><td>${newsBadge(i)} ${newsList(i)}</td><td class="hm" style="font-size:12px;color:var(--muted)">${esc(i.source||'')}</td><td>${esc(i.target||'—')}</td><td class="hm" style="color:var(--muted)">${esc(dt)}</td><td>${held}</td></tr>`;
-  }
-  return h+'</tbody></table></div>';
-}
-function newsCard(n){
-  const s=n.summary;
-  const dt=n.date?new Date(n.date).toLocaleString('cs-CZ',{day:'numeric',month:'numeric',hour:'2-digit',minute:'2-digit'}):'';
-  const typ=n.kind==='weekly'?'Týdenní výhled':'Denní newsletter';
-  let h=`<div class="nc-t">${esc(n.subject)}</div><div class="nc-m">${esc(typ)} · ${esc(dt)}${n.url?` · <a href="${esc(n.url)}" target="_blank" style="color:var(--blue)">otevřít e-mail</a>`:''}</div>`;
-  if(!s){
-    h+=`<div class="nc-o" style="color:var(--muted)">${n.summary_error?esc(n.summary_error):'<span class="sp"></span>Shrnuji...'}</div>`;
-  }else{
-    h+=`<div class="nc-o">${esc(s.overview)}</div>`;
-    if(s.ideas&&s.ideas.length){
-      for(const i of s.ideas){
-        h+=`<div class="idea"><div class="idea-h"><strong>${esc(i.name)}</strong>${i.ticker?`<span class="sm">${esc(i.ticker)}</span>`:''}${newsBadge(i)}${newsList(i)}${i.held===true?'<span class="badge g">máš v portfoliu</span>':''}${i.target?`<span class="sm">cíl: ${esc(i.target)}</span>`:''}</div><div>${esc(i.reason)}</div><div class="idea-s">Zdroj: ${esc(i.source||'newsletter')}</div></div>`;
-      }
-    }else h+='<div class="idea idea-s">Newsletter neobsahuje žádné konkrétní akcie.</div>';
-    if(s.events&&s.events.length)h+=`<div class="idea idea-s"><strong>Co sledovat:</strong><ul>${s.events.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></div>`;
-    if(s.risks&&s.risks.length)h+=`<div class="idea idea-s"><strong>Rizika:</strong><ul>${s.risks.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></div>`;
-  }
-  return`<div class="nc">${h}</div>`;
-}
-let newsTimer=null,newsAt=0;
-async function loadNews(force,poll){
-  if(!force&&!poll&&Date.now()-newsAt<60000)return;
-  newsAt=Date.now();
-  const box=document.getElementById('news-box'),err=document.getElementById('news-err');
-  try{
-    if(force)await fetch('/api/patria-news/refresh',{method:'POST'});
-    const d=await fetch('/api/patria-news').then(r=>r.json());
-    document.getElementById('news-meta').textContent=d.updating?'načítám…':fage(d.updated_at);
-    if(!d.configured){err.innerHTML='<div class="err">Na Renderu chybí proměnná COMPOSIO_API_KEY, newslettery nelze načíst z Gmailu.</div>';box.innerHTML='';return}
-    err.innerHTML=d.error?`<div class="err">${esc(d.error)}</div>`:'';
-    const items=d.items||[];
-    if(!items.length){
-      box.innerHTML=d.updating?'<div style="padding:16px;color:var(--muted)"><span class="sp"></span>Stahuji newslettery z Gmailu a shrnuji je (první načtení trvá 1–2 minuty)...</div>':'<div class="info">Žádné newslettery nenalezeny.</div>';
-    }else{
-      let h=newsAgg(items)+'<div class="sec">Newslettery po dnech</div>'+newsCard(items[0]);
-      const rest=items.slice(1);
-      if(rest.length)h+=`<details><summary class="sm" style="cursor:pointer;margin-bottom:8px">Starší newslettery (${rest.length})</summary>${rest.map(x=>newsCard(x)).join('')}</details>`;
-      if(!d.portfolio_known)h+='<p class="note">Sloupec V portfoliu se doplní, jakmile se načte záložka Moje portfolio (T212).</p>';
-      box.innerHTML=h;
-    }
-    clearTimeout(newsTimer);
-    if(d.updating)newsTimer=setTimeout(()=>loadNews(false,true),5000);
-  }catch(e){err.innerHTML=`<div class="err">Chyba: ${esc(e.message)}</div>`}
 }
 loadCrypto();
 setInterval(loadCrypto,60*60*1000);
@@ -1690,7 +1309,7 @@ async function startPieAnalysis(){
     await fetch('/api/pie-details/refresh',{method:'POST'});
   }catch(e){}
   if(pieCheckInterval)clearInterval(pieCheckInterval);
-  pieCheckInterval=setInterval(checkPieDetails,10000);
+  pieCheckInterval=setInterval(checkPieDetails,20000);
   checkPieDetails();
 }
 async function checkPieDetails(){
@@ -1749,7 +1368,7 @@ async function checkPieStatusOnLoad(){
       document.getElementById('pie-detail-idle').style.display='none';
       document.getElementById('pie-detail-progress').style.display='block';
       if(pieCheckInterval)clearInterval(pieCheckInterval);
-      pieCheckInterval=setInterval(checkPieDetails,10000);
+      pieCheckInterval=setInterval(checkPieDetails,20000);
     }else if(!d.not_started&&!d.error){
       document.getElementById('pie-detail-idle').style.display='none';
       document.getElementById('pie-detail-content').style.display='block';
@@ -1898,27 +1517,6 @@ def api_refresh():
 def api_stocks_refresh():
     refresh_stocks()
     return jsonify({"ok": True})
-
-
-@app.route("/api/patria-news")
-def api_patria_news():
-    started = maybe_refresh_patria_news()
-    c = patria_news_cache
-    items, portfolio_known = annotate_held(list(c["items"]))
-    return jsonify({
-        "configured": bool(COMPOSIO_API_KEY),
-        "items": items,
-        "updated_at": c["updated_at"],
-        "updating": bool(c["updating"] or started),
-        "error": c["error"],
-        "portfolio_known": portfolio_known,
-    })
-
-
-@app.route("/api/patria-news/refresh", methods=["POST"])
-def api_patria_news_refresh():
-    started = maybe_refresh_patria_news(force=True)
-    return jsonify({"ok": True, "started": started})
 
 
 @app.route("/api/debug/positions")
@@ -2107,22 +1705,6 @@ def build_chat_context():
         age = _age_str(stocks_cache.get("patria_at"))
         parts.append(f"CESKE AKCIE - Patria (aktualizovano {age}):\n" + "\n".join(cz_lines))
 
-    # Patria newslettery (shrnuti z e-mailu)
-    news_items = [n for n in (patria_news_cache.get("items") or []) if n.get("summary")]
-    if news_items:
-        news_lines = []
-        for n in news_items[:5]:
-            s = n["summary"]
-            news_lines.append(f"[{(n.get('date') or '')[:10]}] {n['subject']}\n  Prehled: {s.get('overview', '')}")
-            for i in s.get("ideas", []):
-                news_lines.append(
-                    f"  - {i['name']} ({i.get('ticker') or '-'}): {i['kind']}/{i['action']}"
-                    f"{', Patria seznam: ' + i['patria_list'] if i.get('patria_list') else ''}, "
-                    f"zdroj: {i.get('source') or '-'}, duvod: {i.get('reason')}, cil: {i.get('target') or '-'}"
-                )
-        age = _age_str(patria_news_cache.get("updated_at"))
-        parts.append(f"PATRIA NEWSLETTERY - shrnuti z e-mailu (aktualizovano {age}):\n" + "\n".join(news_lines))
-
     # Portfolio
     pdata = portfolio_cache.get("data")
     if pdata:
@@ -2168,19 +1750,21 @@ def build_chat_context():
     elif pie_detail_cache.get("updating"):
         prog = pie_detail_cache.get("progress") or {}
         parts.append(
-            f"ROZPAD KOLACU NA JEDNOTLIVE TITULY: prave se nacita na pozadi "
+            f"ROZPAD KOLACU NA JEDNOTLIVE TITULY: prave se dopocitava na pozadi "
             f"({prog.get('done', 0)}/{prog.get('total', 0)} kolacu hotovo). "
-            "Trading 212 API slozeni kolacu POSKYTUJE, jen ma limit 1 pozadavek za 30 sekund, "
-            "takze nacteni vsech kolacu trva nekolik minut. Rekni uzivateli at pocka a zeptá se znovu."
+            "Toto je JEDINA cast, ktera jeste chybi — vsechna ostatni data vyse (portfolio, "
+            "pozice, hodnoty kolacu, krypto, akcie) MAS k dispozici a normalne s nimi pracuj. "
+            "Netvrd ze 'se jeste nacita portfolio'. Jen pokud se uzivatel pta primo na tituly "
+            "UVNITR kolacu, rekni ze se dopocitavaji a at se zeptá za par minut."
         )
     else:
         parts.append(
-            "ROZPAD KOLACU NA JEDNOTLIVE TITULY: jeste nebyl nacten v teto session. "
+            "ROZPAD KOLACU NA JEDNOTLIVE TITULY: jeste neni nacten. "
             "DULEZITE: Trading 212 API slozeni kolacu POSKYTUJE (endpoint /equity/pies/{id} vraci "
             "jednotlive tituly, jejich aktualni a cilovy podil). NIKDY netvrd ze to API neumi. "
-            "Data se jen nacitaji zvlast, protoze API ma limit 1 pozadavek za 30 sekund. "
-            "Rekni uzivateli at v zalozce 'Moje portfolio (T212)' klikne na tlacitko "
-            "'Analyzovat slozeni kolacu' a pocka cca 5 minut — pak budes mit kompletni slozeni vsech kolacu."
+            "Chybi jen tato jedna cast — ostatni data vyse (portfolio, pozice, hodnoty kolacu) "
+            "MAS a normalne s nimi pracuj. Jen pokud se uzivatel pta na tituly UVNITR kolacu, "
+            "rekni at v zalozce 'Moje portfolio (T212)' klikne na 'Analyzovat slozeni kolacu'."
         )
 
     return "\n\n".join(parts) if parts else "Zadna data zatim nejsou nactena v dashboardu."
@@ -2212,20 +1796,17 @@ def api_chat():
     if stocks_cache.get("world") is None and stocks_cache.get("patria") is None:
         threading.Thread(target=refresh_stocks, daemon=True).start()
         loading_notes.append("akciova doporuceni se prave nacitaji")
-    if not patria_news_cache.get("items") and maybe_refresh_patria_news():
-        loading_notes.append("shrnuti Patria newsletteru se prave nacita")
     if T212_KEY and portfolio_cache.get("data") is None and not portfolio_cache.get("updating"):
         threading.Thread(target=refresh_portfolio, daemon=True).start()
         loading_notes.append("portfolio Trading 212 se prave nacita (muze trvat 1-2 minuty)")
-    if T212_KEY and pie_detail_cache.get("data") is None and not pie_detail_cache.get("updating"):
-        threading.Thread(target=refresh_pie_details, daemon=True).start()
-        loading_notes.append("slozeni kolacu se prave nacita na pozadi (cca 5 minut, kvuli limitu T212 API)")
+    # Pie composition is NEVER auto-triggered — the user starts it manually
+    # with the "Analyzovat slozeni kolacu" button in the portfolio tab.
 
     context = build_chat_context()
 
     system_prompt = (
         "Jsi osobni investicni asistent v investicnim dashboardu uzivatele. "
-        "Dashboard ma zalozky: Krypto, Akcie CZ (Patria, vcetne shrnuti newsletteru Patria Finance z e-mailu), Akcie US (Finnhub), "
+        "Dashboard ma zalozky: Krypto, Akcie CZ (Patria), Akcie US (Finnhub), "
         "Moje portfolio (Trading 212) a tento Chat. "
         "Mas pristup k datum, ktera jsou aktualne nactena v pameti serveru — "
         "NIKDY netvrd ze zalozka 'neexistuje' nebo ze k ni nemas pristup jako k funkci. "
