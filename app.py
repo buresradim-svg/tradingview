@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
-APP_VERSION = "2026-10-23b"
+APP_VERSION = "2026-10-23c"
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
@@ -474,10 +474,136 @@ def _composio_unwrap(res):
     return data.get("response_data") or data
 
 
+COMPOSIO_MCP_URL = os.environ.get("COMPOSIO_MCP_URL", "https://connect.composio.dev/mcp")
+PATRIA_GMAIL_EMAIL = os.environ.get("PATRIA_GMAIL_EMAIL", "buresradim@gmail.com").lower()
+_mcp_account_cache = {}
+
+
+def _mcp_parse(r, want_id):
+    """Parse a Streamable-HTTP MCP response (plain JSON or SSE) and return the JSON-RPC message."""
+    ctype = (r.headers.get("content-type") or "").lower()
+    msgs = []
+    if "text/event-stream" in ctype:
+        for line in r.text.splitlines():
+            if line.startswith("data:"):
+                try:
+                    msgs.append(json.loads(line[5:].strip()))
+                except Exception:
+                    pass
+    elif r.text.strip():
+        body = r.json()
+        msgs = body if isinstance(body, list) else [body]
+    for m in msgs:
+        if isinstance(m, dict) and m.get("id") == want_id:
+            if m.get("error"):
+                raise RuntimeError(f"MCP chyba: {m['error'].get('message') or m['error']}")
+            return m.get("result") or {}
+    raise RuntimeError(f"MCP: nečekaná odpověď (HTTP {r.status_code}): {r.text[:200]}")
+
+
+class _ComposioMCP:
+    """Minimal MCP client for Composio Connect (consumer key ck_...)."""
+
+    def __init__(self, key):
+        self.key = key
+        self.sid = None
+        self.proto = "2025-06-18"
+        self.next_id = 1
+
+    def _headers(self):
+        h = {
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+            "x-consumer-api-key": self.key,
+        }
+        if self.sid:
+            h["mcp-session-id"] = self.sid
+            h["mcp-protocol-version"] = self.proto
+        return h
+
+    def _rpc(self, method, params=None, notify=False):
+        body = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            body["params"] = params
+        if not notify:
+            body["id"] = self.next_id
+            self.next_id += 1
+        r = requests.post(COMPOSIO_MCP_URL, headers=self._headers(), json=body, timeout=60)
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"Composio MCP odmítl klíč (HTTP {r.status_code}) — zkontroluj COMPOSIO_API_KEY (ck_...)")
+        r.raise_for_status()
+        if r.headers.get("mcp-session-id"):
+            self.sid = r.headers["mcp-session-id"]
+        return None if notify else _mcp_parse(r, body["id"])
+
+    def connect(self):
+        res = self._rpc("initialize", {
+            "protocolVersion": self.proto,
+            "capabilities": {},
+            "clientInfo": {"name": "investicni-dashboard", "version": "1.0"},
+        })
+        self.proto = res.get("protocolVersion") or self.proto
+        try:
+            self._rpc("notifications/initialized", notify=True)
+        except Exception:
+            pass
+        return self
+
+    def call(self, tool, arguments):
+        res = self._rpc("tools/call", {"name": tool, "arguments": arguments})
+        if res.get("structuredContent"):
+            data = res["structuredContent"]
+        else:
+            text = "".join(c.get("text", "") for c in (res.get("content") or []) if c.get("type") == "text")
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {"_text": text}
+        if res.get("isError"):
+            raise RuntimeError(f"Composio MCP: {str(data)[:300]}")
+        return data
+
+
+def _mcp_gmail_account(client):
+    """Find the Composio connection id of the personal Gmail by e-mail address."""
+    if PATRIA_GMAIL_EMAIL in _mcp_account_cache:
+        return _mcp_account_cache[PATRIA_GMAIL_EMAIL]
+    data = client.call("COMPOSIO_MANAGE_CONNECTIONS", {"toolkits": [{"name": "gmail", "action": "list"}]})
+    accounts = (((data.get("data") or {}).get("results") or {}).get("gmail") or {}).get("accounts") or []
+    for a in accounts:
+        if ((a.get("user_info") or {}).get("email") or "").lower() == PATRIA_GMAIL_EMAIL:
+            _mcp_account_cache[PATRIA_GMAIL_EMAIL] = a.get("id")
+            return a.get("id")
+    found = ", ".join((a.get("user_info") or {}).get("email") or "?" for a in accounts) or "žádný"
+    raise RuntimeError(f"V Composiu není připojený Gmail {PATRIA_GMAIL_EMAIL} (připojené: {found})")
+
+
+def composio_execute_mcp(slug, arguments):
+    client = _ComposioMCP(COMPOSIO_API_KEY).connect()
+    account = _mcp_gmail_account(client) if slug.startswith("GMAIL_") else None
+    item = {"tool_slug": slug, "arguments": arguments}
+    if account:
+        item["account"] = account
+    data = client.call("COMPOSIO_MULTI_EXECUTE_TOOL", {
+        "tools": [item],
+        "sync_response_to_workbench": False,
+        "thought": "Investiční dashboard stahuje newslettery Patria",
+    })
+    results = (data.get("data") or {}).get("results") or []
+    if not results:
+        raise RuntimeError(f"Composio MCP: prázdná odpověď ({str(data)[:200]})")
+    resp = results[0].get("response") or {}
+    if resp.get("successful") is False or results[0].get("error"):
+        raise RuntimeError(f"Composio: {resp.get('error') or results[0].get('error')}")
+    return resp.get("data") or {}
+
+
 def composio_execute(slug, arguments):
     """Spustí Composio nástroj. Nejdřív oficiální Python SDK, při selhání REST API v3."""
     if not COMPOSIO_API_KEY:
         raise RuntimeError("Chybí proměnná COMPOSIO_API_KEY")
+    if COMPOSIO_API_KEY.startswith("ck_"):
+        return composio_execute_mcp(slug, arguments)
     errors = []
     res = None
     try:
