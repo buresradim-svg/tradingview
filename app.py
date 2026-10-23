@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
+APP_VERSION = "2026-10-23b"
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
@@ -457,6 +458,7 @@ PATRIA_NEWS_TTL = timedelta(hours=4)
 PATRIA_NEWS_RETRY = timedelta(minutes=10)
 
 patria_news_cache = {
+    "stage": "", "started_at": None,
     "items": [], "updated_at": None, "attempted_at": None,
     "updating": False, "error": None, "summaries": {},
 }
@@ -486,9 +488,22 @@ def composio_execute(slug, arguments):
             kwargs["user_id"] = COMPOSIO_USER_ID
         if COMPOSIO_GMAIL_ACCOUNT_ID:
             kwargs["connected_account_id"] = COMPOSIO_GMAIL_ACCOUNT_ID
-        res = client.tools.execute(slug, arguments, **kwargs)
+        box = {}
+        def _run():
+            try:
+                box["res"] = client.tools.execute(slug, arguments, **kwargs)
+            except Exception as ex:
+                box["err"] = ex
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=60)
+        if t.is_alive():
+            raise TimeoutError("Composio neodpovědělo do 60 s")
+        if "err" in box:
+            raise box["err"]
+        res = box.get("res")
     except Exception as e:
-        errors.append(f"SDK: {e}")
+        errors.append(f"SDK: {type(e).__name__}: {e}" if not str(e) else f"SDK: {e}")
     if res is None:
         try:
             body = {"arguments": arguments}
@@ -658,8 +673,11 @@ def refresh_patria_news():
             return
         c["updating"] = True
     c["error"] = None
+    c["started_at"] = datetime.now(timezone.utc).isoformat()
     try:
+        c["stage"] = "stahuji e-maily z Gmailu (Composio)"
         msgs = fetch_patria_newsletters()
+        c["stage"] = f"staženo {len(msgs)} e-mailů, shrnuji"
         items = []
         for m in msgs:
             items.append({
@@ -678,8 +696,10 @@ def refresh_patria_news():
                 c["summaries"][it["id"]] = it["summary"]
             except Exception as e:
                 it["summary_error"] = f"Shrnutí se nepodařilo: {e}"[:300]
+        c["stage"] = "hotovo"
     except Exception as e:
         c["error"] = str(e)
+        c["stage"] = "chyba"
     finally:
         c["attempted_at"] = datetime.now(timezone.utc).isoformat()
         c["updating"] = False
@@ -688,8 +708,13 @@ def refresh_patria_news():
 def maybe_refresh_patria_news(force=False):
     """Spustí obnovu na pozadí, pokud jsou data stará. Vrací True, když se obnova spustila."""
     c = patria_news_cache
-    if c["updating"] or not COMPOSIO_API_KEY:
+    if not COMPOSIO_API_KEY:
         return False
+    if c["updating"]:
+        st = c.get("started_at")
+        if not (st and datetime.now(timezone.utc) - datetime.fromisoformat(st) > timedelta(minutes=5)):
+            return False
+        c["updating"] = False  # previous run is stuck — allow a fresh one
     now = datetime.now(timezone.utc)
     if not force:
         att = c.get("attempted_at")
@@ -2041,6 +2066,11 @@ def api_patria_news():
         "updating": bool(c["updating"] or started),
         "error": c["error"],
         "portfolio_known": portfolio_known,
+        "stage": c.get("stage", ""),
+        "started_at": c.get("started_at"),
+        "version": APP_VERSION,
+        "gmail_account_set": bool(COMPOSIO_GMAIL_ACCOUNT_ID),
+        "user_id_set": bool(COMPOSIO_USER_ID),
     })
 
 
