@@ -314,7 +314,7 @@ def fetch_patria_recommendations():
 
     return {
         "cz": results_cz[:25],
-        "world_monitor": results_monitor[:25],
+        "world_monitor": results_monitor[:80],
         "scraped_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1342,7 +1342,7 @@ tr:last-child td{border-bottom:none}
     </table></div>
     <div class="sec">Monitoring — doporučení globálních bank</div>
     <div class="tw"><table>
-      <thead><tr><th>Akcie</th><th class="hm">Analytická firma</th><th>Doporučení</th><th class="hm">Předchozí</th><th>Cílová cena</th></tr></thead>
+      <thead><tr><th>Akcie</th><th>Konsenzus</th><th>Průměrný cíl</th><th class="hm">Rozpětí cílů</th><th>Analytici</th></tr></thead>
       <tbody id="mon-tb"><tr><td colspan="5" style="text-align:center;padding:20px;color:var(--muted)"><span class="sp"></span>Načítám...</td></tr></tbody>
     </table></div>
 
@@ -1503,6 +1503,43 @@ async function loadCrypto(){
   }catch(e){document.getElementById('cerr').innerHTML=`<div class="err">Chyba: ${e.message}</div>`;document.getElementById('dot').className='dot'}
 }
 let sDone=false;
+function monClass(r){
+  const s=(r||'').toLowerCase();
+  if(!s||s.includes('nepokr')||s.includes('suspend')||s.includes('revizi'))return null;
+  if(/(sell|prodat|underperform|underweight|reduce|redukovat)/.test(s))return 'sell';
+  if(/(buy|koupit|outperform|overweight|\\badd\\b|accumul|akumul)/.test(s))return 'buy';
+  return 'hold';
+}
+function parseTarget(t){
+  const m=(t||'').replace(/\\s/g,'').match(/^([\\d.,]+)([A-Za-z]*)$/);
+  if(!m)return null;
+  const v=parseFloat(m[1].replace(/\\./g,'').replace(',','.'));
+  return v>0?{v,cur:m[2]||''}:null;
+}
+function fmtNum(v){return v.toLocaleString('cs-CZ',{maximumFractionDigits:v>=100?0:2})}
+function groupMonitor(rows){
+  const map=new Map();
+  for(const r of rows){
+    if(!map.has(r.name))map.set(r.name,{name:r.name,buy:0,hold:0,sell:0,targets:[],cur:'',items:[]});
+    const g=map.get(r.name);
+    const c=monClass(r.rec);
+    if(c)g[c]++;
+    const t=parseTarget(r.target);
+    if(t&&c){g.targets.push(t.v);g.cur=g.cur||t.cur;}
+    g.items.push(r);
+  }
+  // most-covered titles first
+  return [...map.values()].sort((a,b)=>(b.buy+b.hold+b.sell)-(a.buy+a.hold+a.sell));
+}
+function monRow(g){
+  const n=g.buy+g.hold+g.sell;
+  const cons=n?[g.buy?`<span class="badge g">${g.buy}× koupit</span>`:'',g.hold?`<span class="badge a">${g.hold}× držet</span>`:'',g.sell?`<span class="badge r">${g.sell}× prodat</span>`:''].filter(Boolean).join(' '):'<span class="badge n">bez hodnocení</span>';
+  const ts=g.targets;
+  const avg=ts.length?`${fmtNum(ts.reduce((a,b)=>a+b,0)/ts.length)} ${g.cur}`:'—';
+  const range=ts.length>1?`${fmtNum(Math.min(...ts))}–${fmtNum(Math.max(...ts))} ${g.cur}`:'—';
+  const list=g.items.map(r=>`<div style="font-size:12px;padding:3px 0;border-top:0.5px solid var(--border)"><strong>${r.analyst||'—'}</strong>: <span class="badge ${bc(r.rec)}">${r.rec||'—'}</span>${r.rec_prev&&r.rec_prev!==r.rec?` <span style="color:var(--muted)">(dříve ${r.rec_prev})</span>`:''}${r.target?` · cíl ${r.target}`:''}</div>`).join('');
+  return `<tr><td><strong>${g.name}</strong></td><td>${cons}</td><td>${avg}</td><td class="hm" style="color:var(--muted);font-size:12px">${range}</td><td><details><summary style="cursor:pointer;font-size:12px;color:var(--muted)">${g.items.length} ${g.items.length===1?'firma':g.items.length<5?'firmy':'firem'}</summary>${list}</details></td></tr>`;
+}
 let stocksPoll=null;
 async function forceRefreshStocks(){
   try{await fetch('/api/stocks/refresh',{method:'POST'});}catch(e){}
@@ -1525,7 +1562,7 @@ async function loadStocks(force){
     document.getElementById('cz-tb').innerHTML=czR;
     const mon=d.patria?.world_monitor||[];
     let monR='';
-    if(mon.length){for(const s of mon)monR+=`<tr><td><strong>${s.name}</strong></td><td class="hm" style="color:var(--muted);font-size:12px">${s.analyst||'—'}</td><td><span class="badge ${bc(s.rec)}">${s.rec||'—'}</span></td><td class="hm" style="color:var(--muted);font-size:12px">${s.rec_prev||'—'}</td><td>${s.target||'—'}</td></tr>`;}
+    if(mon.length){for(const g of groupMonitor(mon))monR+=monRow(g);}
     else monR='<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--muted)">'+(d.updating?'<span class="sp"></span>Načítám…':'Žádná data')+'</td></tr>';
     document.getElementById('mon-tb').innerHTML=monR;
     const us=d.world||[];
